@@ -1,0 +1,19 @@
+{
+  "sensors": [
+    { "uid": "21000000000000000000000001", "serial": "", "name": "液位-1",
+      "measureMode": "level", "installHeightCm": 0, "calibOffsetMm": 0,
+      "reportPeriodSeconds": 300, "lowBatteryPercent": 80,
+      "offlineTimeoutSeconds": 900, "enabled": true },
+    { "uid": "21000000000000000000000002", "serial": "", "name": "液位-2",
+      "measureMode": "level", "installHeightCm": 0, "calibOffsetMm": 0,
+      "reportPeriodSeconds": 300, "lowBatteryPercent": 80,
+      "offlineTimeoutSeconds": 900, "enabled": true }
+  ],
+  "devices": [
+    { "uid": "31000000000000000000000001", "serial": "", "name": "声光-1",
+      "type": 1, "volume": 50, "flashMode": 1, "enabled": true },
+    { "uid": "31000000000000000000000002", "serial": "", "name": "声光-2",
+      "type": 1, "volume": 50, "flashMode": 1, "enabled": true }
+  ],
+  "meta": { "configVersion": 1, "updatedAt": 0 }
+}

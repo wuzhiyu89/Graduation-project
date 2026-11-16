@@ -1,0 +1,477 @@
+/**
+ * @file  cloud_cmd_cfg.c
+ * @brief 配置类命令：cfg.set / cfg.query / sys.factory_reset（文档 5.2 / 5.1 第 4 条）
+ *
+ * 三条命令都围绕"整份配置"工作（实测 2640 B），因此统一用 cloud_proto.c 里的
+ * 文件级暂存缓冲 cloud_cfg_staging_buf —— 单线程轮询、不会重入，放栈上会爆 4 KB。
+ * ★2026-11-12 任务二 A′: 原来 cfg.query / sys.factory_reset 另有独立的
+ *   s_cfg_reset_tmp(又 2640 B)。两条命令与 cfg.set 是同一个命令分发器里的互斥分支,
+ *   从来不会同时持有那份副本, 现在也统一到 cloud_cfg_staging_buf。
+ *
+ * 写路径一律是：合并到副本 -> 校验 -> 落 Flash -> 成功才提交给当前实例。
+ */
+#include <stdio.h>
+#include <string.h>
+
+#include "cloud_proto.h"
+#include "cloud_internal.h"
+#include "cloud_json.h"
+#include "cloud_profile.h"
+#include "config_store.h"
+#include "lora_business.h"      /* LORA_SENSOR_REPORT_DEFAULT_S */
+#include "telemetry_cache.h"    /* 恢复出厂: 清掉待补报队列 */
+#include "event_cache.h"
+#include "log.h"
+
+/**
+ * @brief cfg.set —— 文档 5.2
+ *   data.expectVersion(uint32, 必填): 与当前 configVersion 不一致 -> 1002，且什么都不改；
+ *   data.effectiveMode(string, 可选): immediate(默认) / reboot
+ *   data.sections(object, 必填): 键为域名, 值为该域完整或部分字段
+ *   应答 data: {"configVersion":7,"applied":["thresholds","sensors"],"rejected":[]}
+ */
+int cloud_cmd_cfg_set(const cloud_req_t *req, cJSON *data)
+{
+    const char           *sections;
+    cfg_sections_result_t res;
+    uint32_t              expect;
+    uint32_t              cur;
+    int                   rc = CLOUD_EC_OK;
+    /* (用户决定不做 effectiveMode 回显 -> 这里不再需要记住它是 immediate 还是 reboot) */
+
+    if (req->data == NULL)
+    {
+        return CLOUD_EC_PARAM;              /* 连 data 段都没有 */
+    }
+
+    /* ---- data.expectVersion(必填) ---- */
+    if (cj_get(req->data, "expectVersion", NULL, 0) != CJ_NUM)
+    {
+        return CLOUD_EC_PARAM;              /* 缺失或不是数字 */
+    }
+    /* 超出 uint32 的巨型数字会落到这里给的哨兵值, 结果是与当前版本不符 -> 1002。
+     * 1001/1002 都是"拒绝", 平台都看得懂, 不必为这种输入再分一档。 */
+    expect = cj_get_uint(req->data, "expectVersion", 0xFFFFFFFFu);
+
+    cur = config_store_version();
+    if (expect != cur)
+    {
+        /* 【版本冲突必须什么都不改】否则平台会以为自己的旧配置被接受了 */
+        return CLOUD_EC_VER_CONFLICT;
+    }
+
+    /* ---- data.effectiveMode(可选) ---- */
+    if (cj_get(req->data, "effectiveMode", NULL, 0) != CJ_NOTFOUND)
+    {
+        char mode[16];
+
+        if (!cj_get_str(req->data, "effectiveMode", mode, (uint16_t)sizeof(mode)))
+        {
+            return CLOUD_EC_PARAM;
+        }
+        if ((strcmp(mode, "immediate") != 0) && (strcmp(mode, "reboot") != 0))
+        {
+            return CLOUD_EC_PARAM;
+        }
+        /* 【本实现对两种模式的实际差别: 没有】—— 如实记档, 不假装有。
+         *   本工程的配置是"一份结构体 + 立即落 Flash", 运行期消费方(阈值/档位/规则)
+         *   每拍都直接读它, 所以:
+         *     · immediate: 写完立即生效(与文档一致);
+         *     · reboot   : 文档原意是"重启后再生效", 但本实现【不延迟应用】——
+         *                  值现在就落到运行期结构里了, 差别只体现在那些本来就要
+         *                  重启才生效的域(目前只有 network, 见 cfg.set 里那段说明)。
+         *   为什么不模拟 reboot: 那需要再存一份待生效副本并在启动时切换, 对一份
+         *   单实例配置来说只会制造 RAM 与 Flash 不一致的新隐患, 收益却只是让
+         *   应答更贴文档。已在本条目的台账里记为【有意差异】。
+         *   ⚠️ 本函数【不会】因为 reboot 就自行重启: 重启由平台显式下发 sys.reboot。 */
+        /* (只校验取值合法; 不再记住它 —— 用户决定不做回显) */
+    }
+
+    /* ---- data.sections(必填, 对象) ---- */
+    /* cj_get_sub 返回的是指向原报文内部的指针(零拷贝, 不保证 NUL 结尾;
+     * cloud_json 的路径解析是按括号配平走的, 所以子对象后面还有字符也没关系)。 */
+    sections = cj_get_sub(req->data, "sections");
+    if (sections == NULL)
+    {
+        return CLOUD_EC_PARAM;
+    }
+
+    /* ---- ★2026-10-28(A3): sections 里出现只读的 meta 域 -> 整条拒绝, 回 1001 ----
+     * 依据: 协议 §5.2 参数表("不含只读 meta 域: 携带即显式拒绝、回 1001",
+     *       与 sen.set/dev.set 携带只读字段同一口径, 1027 联调拍板);
+     *       配置 §3.9 meta 是"系统维护, 平台只读"。
+     * 【以前的问题】meta 被当成"认识的域"接受了, 但 config_store_merge_sections()
+     *   对它静默忽略 —— 整条命令回 code=0, applied/rejected 都不含 meta,
+     *   平台以为"改了但没生效", 实际一个字没动。
+     * 【为什么整条拒绝, 而不是把 meta 塞进 rejected[]】rejected[] 是"域级事务"的产物
+     *   (其它域照常生效); 文档给这条定的错误码是 1001, 属【命令级拒绝】。两者不能混:
+     *   混了平台就无法区分"这条命令根本没执行"和"某域被拒、其它域已生效"。
+     * 【顺序】必须放在 staging 拷贝与合并【之前】: 否则 RAM 副本已经被改过才返回失败,
+     *   紧接着的 cfg.query 会读到"应答说失败、值却变了"的鬼数据。 */
+    if (cj_get(sections, "meta", NULL, 0) != CJ_NOTFOUND)
+    {
+        log_info("[CFG] !! cfg.set 携带只读 meta 域 -> 1001(整条拒绝, 未改动任何域)\r\n");
+        return CLOUD_EC_PARAM;
+    }
+
+    /* ---- 逐域合并(每域独立事务: 合法的生效, 非法的被拒) ---- */
+    (void)memcpy(&cloud_cfg_staging_buf, config_store_get(), sizeof(cloud_cfg_staging_buf));
+    if (config_store_merge_sections(&cloud_cfg_staging_buf, sections, &res) != CFG_OK)
+    {
+        return CLOUD_EC_PARAM;
+    }
+
+    /* ---- 拼错的域名必须报出来, 不能默默忽略 ----
+     * config_store_merge_sections() 只认 8 个已知域, sections 里其它键会被
+     * 【静默丢弃】。于是平台把 "thresholds" 打成 "threshold", 我们回 code=0,
+     * 而 applied / rejected 都是空的 —— 平台以为改成功了, 实际一个字没动。
+     * cloud_json 没有"对象键遍历"接口, 所以这里用低成本判据:
+     *   逐个数这 8 个已知域名有没有出现; 若【一个都没出现】而 sections 又不是空对象,
+     *   那就是键名全拼错了 -> 回 1001, 让平台立刻看到。
+     * 【已知残留】"部分拼错"(一个对 + 一个错)仍会被漏掉, 只表现为 applied 里少一项;
+     *   要彻底解决需要给 cloud_json 加对象键遍历接口。 */
+    {
+        /* meta 仍在 known[] 里保留(这里维护的是"9 个配置域"的完整清单),
+         * 但它在上面已经被单独拦成 1001, 走到这里时 sections 里不可能还有 meta。
+         * 留着是为了让清单与 config_store 的 9 个域一一对应 —— 不要因为多了一条
+         * 判定就把清单项删掉, 否则以后加域时会漏。 */
+        static const char *const known[] = { "system", "network", "sensors", "thresholds",
+                                             "gears", "devices", "rules", "ota", "meta" };
+        uint8_t     n;
+        uint8_t     present = 0u;
+        const char *p;
+        bool        is_empty_obj = false;
+
+        for (n = 0u; n < 9u; n++)
+        {
+            if (cj_get(sections, known[n], NULL, 0) != CJ_NOTFOUND) { present++; }
+        }
+
+        /* sections 是不是空对象 {}（空对象合法：什么都不改） */
+        p = sections;
+        while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r')) { p++; }
+        if (*p == '{')
+        {
+            p++;
+            while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r')) { p++; }
+            if (*p == '}') { is_empty_obj = true; }
+        }
+
+        if ((present == 0u) && !is_empty_obj)
+        {
+            return CLOUD_EC_PARAM;
+        }
+    }
+
+    /* ---- network 域: 【接受】"按文档重启生效" ----
+     * 文档 5.2 末尾: "network 域修改后本网关重启生效，生效前旧连接保持"。
+     * 本工程的连接参数本来就是从 config_store.network 读 —— main.c 开机时把它交给
+     * g4_at_set_broker()(开机日志那行 "[BOOT] broker 来自配置 network: ..." 就是它),
+     * 而运行期【不会】热重连。所以"写下去 + 重启生效 + 旧连接保持"与文档完全一致,
+     * 应答也不撒谎: 平台重启网关后连的就是新地址。
+     *
+     * ⚠️ 旧版本这里是把 network 整域【拒掉】的, 理由是"运行期读的是 param_save
+     *    那一份" —— 那是 P2-7 统一之前的情况; 现在读的就是 config_store, 所以改判。
+     * ⚠️ 唯一必须守住的一条: 【不要】在运行期热改连接参数 —— 那会打断正在跑的业务
+     *    连接, 而文档明确要求"生效前旧连接保持"。所以本函数一行都不碰 g4_at。 */
+    if ((res.applied & CFG_CH_NETWORK) != 0u)
+    {
+        log_info("[CFG] cfg.set 改了 network 域 -> 已落盘(重启后生效, 当前连接不受影响)\r\n");
+    }
+
+    /* ---- 有域生效才 +1 版本并落 Flash; 全部被拒时版本不动、Flash 不动 ---- */
+    if (res.applied != 0u)
+    {
+        config_store_t *live;
+
+        config_store_touch(&cloud_cfg_staging_buf, cloud_proto_get_now_ts());
+
+        if (config_store_save(&cloud_cfg_staging_buf) != CFG_OK)
+        {
+            /* Flash 失败: 这些改动只存在于 RAM 副本, 掉电即失, 所以如实全部
+             * 记为 rejected 并回 1007。绝不"应答说成功、实际没存住"。 */
+            res.rejected |= res.applied;
+            res.applied   = 0u;
+            rc = CLOUD_EC_INTERNAL;
+        }
+        else
+        {
+            /* 落盘成功才提交给"当前配置"实例 —— 紧接着的 cfg.query 才能读到新值 */
+            live = config_store_get_mut();
+            (void)memcpy(live, &cloud_cfg_staging_buf, sizeof(*live));
+
+            /* 运行期新增的 sensors[]/devices[] 必须进从机表, 否则下发/解绑报 1003 */
+            lora_business_ensure_slaves();
+        }
+    }
+
+    /* ---- ★ 传感器参数: 与 sen.set 同一口径 ----
+     * 云端已改用 cfg.set 控制传感器。sensors[] 里只要显式带了【任一设备侧参数】
+     * (上报周期/测量模式/安装高度/校准偏移/低电量阈值), 落盘成功后就要用 0x01
+     * 下发给传感器本身; 否则设备仍按旧参数工作。
+     * 顺序与 sen.set 一致: 先确认落盘成功, 再动设备(落盘失败时 applied 已清空)。 */
+    if ((res.applied & CFG_CH_SENSORS) != 0u)
+    {
+        static const char *const dev_keys[] =
+        {
+            "reportPeriodSeconds", "measureMode", "installHeightCm",
+            "calibOffsetMm",       "lowBatteryPercent"
+        };
+        uint16_t cnt = cj_count(sections, "sensors");
+        uint16_t i;
+
+        for (i = 0u; i < cnt; i++)
+        {
+            char     path[40];
+            char     uid[CFG_UID_STR_MAX];
+            uint16_t period = 0u;
+            bool     device_dirty = false;
+            uint8_t  k;
+
+            (void)snprintf(path, sizeof(path), "sensors[%u].uid", (unsigned)i);
+            if (!cj_get_str(sections, path, uid, (uint16_t)sizeof(uid)) ||
+                !cfg_uid_valid(uid))
+            {
+                continue;               /* 该域已整体校验过, 这里只做尽力而为 */
+            }
+
+            for (k = 0u; k < (uint8_t)(sizeof(dev_keys) / sizeof(dev_keys[0])); k++)
+            {
+                (void)snprintf(path, sizeof(path), "sensors[%u].%s",
+                               (unsigned)i, dev_keys[k]);
+                if (cj_get(sections, path, NULL, 0u) != CJ_NOTFOUND)
+                {
+                    device_dirty = true;
+                    break;
+                }
+            }
+            if (!device_dirty)
+            {
+                continue;               /* 没动任何设备侧参数: 不需要动设备 */
+            }
+
+            /* 上报周期取【落盘后】的配置值: JSON 没给时就是原值,
+             * 0x01 需要的仍是一个完整的 18 字节参数包。 */
+            {
+                const config_store_t *live_cfg = config_store_get();
+                const cfg_sensor_t   *s = NULL;
+                uint8_t               n;
+
+                for (n = 0u; (live_cfg != NULL) && (n < live_cfg->sensor_count) &&
+                              (n < (uint8_t)CFG_SENSOR_MAX); n++)
+                {
+                    if (strcmp(live_cfg->sensors[n].uid, uid) == 0)
+                    {
+                        s = &live_cfg->sensors[n];
+                        break;
+                    }
+                }
+                if (s != NULL)
+                {
+                    period = s->report_period_s;
+                }
+            }
+
+            if (period == 0u)
+            {
+                period = LORA_SENSOR_REPORT_DEFAULT_S;
+            }
+            (void)cloud_push_sensor_params(uid, period);
+        }
+    }
+
+    /* ---- 应答 data(文档 5.2: configVersion + applied[] + rejected[]) ---- */
+    if ((cJSON_AddNumberToObject(data, "configVersion",
+            (double)config_store_version()) == NULL) ||
+        (!cloud_write_section_list(data, "applied",  res.applied)) ||
+        (!cloud_write_section_list(data, "rejected", res.rejected)))
+    {
+        return CLOUD_EC_INTERNAL;       /* 池满: 明确失败, 绝不发半条应答 */
+    }
+
+    /* ★ 2026-09-30 用户决定: 【不做 rejectedDetail, 也不做 effectiveMode 回显】★
+     *   · effectiveMode 在文档里本来就是【非必填】——收了就按"立即落盘"处理即可,
+     *     不必回显; 本实现对 immediate/reboot 也无实际差别(见上面那段说明)。
+     *   · rejected 只回域名数组(文档示例就是这个格式)。要给出原因的话需要把
+     *     "哪个域、哪条规则"的原因从 config_store 逐级带出来, 而拒绝的可能太多,
+     *     成本远大于收益 —— 用户明确不做。
+     *   ⚠️ 所以 rejected 的非空只表示"这一域整域被拒"(文档 5.2 的语义),
+     *      想知道具体原因要看网关日志。 */
+    return rc;
+}
+
+int cloud_cmd_cfg_query(const cloud_req_t *req, cJSON *data)
+{
+    uint16_t mask = 0u;
+    uint8_t  i;
+    int      rc;
+
+    rc = cloud_cfg_sections_mask(req, &mask);
+    if (rc != CLOUD_EC_OK)
+    {
+        return rc;
+    }
+
+    /* data 对象已经由 cloud_proto_handle() obj_begin 过了, 这里只写成员 */
+    /* ★2026-10-27: 用一份"掩码副本"生成应答★
+     * 直接把 live 写出去再改 username/password 会导致 meta.crc32 与内容不一致
+     * (读回自校验必失败)。这里复制一份、掩码后由同一个写入器生成, CRC 自然正确。 */
+    {
+        const config_store_t *live = config_store_get();
+        config_store_t       *qcfg = &cloud_cfg_staging_buf;   /* 与其它配置命令共用 */
+
+        (void)memcpy(qcfg, live, sizeof(*qcfg));
+        /* 统一掩码串(6 个星号) —— 以前 username / password 各自手写, 个数还对不上 */
+        (void)strcpy(qcfg->network.username,      CFG_CRED_MASK);
+        (void)strcpy(qcfg->network.mqtt_password, CFG_CRED_MASK);
+        if (!config_store_write_members(data, qcfg))
+        {
+            return CLOUD_EC_INTERNAL;
+        }
+
+        /* ★CRC 的口径(2026-10-30 重定)★
+         * 解析器现在对 username / password 的"全星号"都是【不修改】(保留原值),
+         * 所以把这份应答原样读回去, 得到的配置就是 live 本身 —— 于是 meta.crc32
+         * 必须按【未掩码的 live】算。
+         * 旧代码是配合"username 会被写成星号、password 被跳过"的旧语义, 把
+         * password 置空再算一次; 那个前提今天不成立了, 若照旧会得到一个
+         * 与任何真实配置都对不上的 CRC。 */
+        {
+            uint32_t crc  = config_store_calc_crc(live);
+            char     hex[12];
+            cJSON   *meta = cJSON_GetObjectItem(data, "meta");
+
+            if ((meta != NULL) && (crc != 0u))
+            {
+                (void)snprintf(hex, sizeof(hex), "%08lX", (unsigned long)crc);
+                cJSON_DeleteItemFromObject(meta, "crc32");
+                (void)cJSON_AddStringToObject(meta, "crc32", hex);
+            }
+        }
+    }
+
+    /* 与 rule.query / sen.query 同一套办法: 全写出来再删掉不要的 ——
+     * 这样字段名与键序永远与写入器同源, 不会漂移。 */
+    for (i = 0u; i < (uint8_t)CLOUD_CFG_SECTION_N; i++)
+    {
+        if ((mask & (uint16_t)(1u << i)) == 0u)
+        {
+            cJSON_DeleteItemFromObject(data, cloud_cfg_section_names[i]);
+        }
+    }
+    return CLOUD_EC_OK;
+}
+
+/* 恢复出厂时要保留下来的 network 域。
+ * 必须是文件级 static: cfg_network_t 放 4KB 的栈上会挤掉命令处理链的余量
+ * (startup_n32h47x_48x.s 的 Stack_Size)。工作副本已并入 cloud_cfg_staging_buf。 */
+static cfg_network_t  s_keep_network;
+
+int cloud_cmd_sys_factory_reset(const cloud_req_t *req, cJSON *data)
+{
+    bool         keep_network = true;       /* 文档默认值 true */
+    cfg_result_t r;
+
+    /* ---- data.keepNetwork(bool, 可选, 默认 true) ---- */
+    if (req->data != NULL)
+    {
+        cj_type_t t = cj_get(req->data, "keepNetwork", NULL, 0u);
+
+        if (t != CJ_NOTFOUND)
+        {
+            /* 文档类型是 bool; 也宽容接受 0/1(部分平台客户端把 bool 写成数字),
+             * 但字符串/对象等一律 1001 —— 不猜它想表达什么。 */
+            if ((t != CJ_BOOL) && (t != CJ_NUM))
+            {
+                return CLOUD_EC_PARAM;
+            }
+            keep_network = cj_get_bool(req->data, "keepNetwork", true);
+        }
+    }
+
+    if (!keep_network)
+    {
+        /* 不保留 network: 直接用现成的 config_store_reset()
+         * (= 填出厂默认 + updatedAt + 落 Flash), 与文档其余配置域恢复出厂默认一致;
+         * network 也一起回默认"完全丢配置", 不必自己再拼一份。 */
+        r = config_store_reset(&cloud_cfg_staging_buf, cloud_proto_get_now_ts());
+    }
+    else
+    {
+        /* 【保留 network 时为什么不能也用 config_store_reset()】
+         * 它是"先填默认再落盘", 会把 network 一起清掉; 若先 reset 再回填 network
+         * 并二次落盘, Flash 就会经历一次"network 被清空"的中间态 —— 那两次写盘之间
+         * 掉电, 网关恢复出厂后连不上 broker, 现场无法远程救回。
+         * 所以改为: 填出厂默认 -> 回填 network -> 【一次】写盘。 */
+        const config_store_t *cur = config_store_get();
+
+        s_keep_network = cur->network;              /* 先把要保留的域拷出来 */
+        config_store_factory_default(&cloud_cfg_staging_buf);
+        cloud_cfg_staging_buf.network         = s_keep_network;
+        cloud_cfg_staging_buf.meta.updated_at = cloud_proto_get_now_ts();   /* 与 config_store_reset 同一口径 */
+        r = config_store_save(&cloud_cfg_staging_buf);
+    }
+
+    if (r != CFG_OK)
+    {
+        /* 落盘失败 -> 1007, 且让内存里的当前配置一个字都不动。
+         * 这样 RAM 与 Flash 不会出现"一个变了、一个没变"的分裂状态。 */
+        log_info("[CLOUD] !! sys.factory_reset 落 Flash 失败(code=%d), 回 1007, 当前配置未改动\r\n",
+                 (int)r);
+        return CLOUD_EC_INTERNAL;
+    }
+
+    /* 落盘成功才提交给"当前配置"实例 */
+    (void)memcpy(config_store_get_mut(), &cloud_cfg_staging_buf,
+                 sizeof(cloud_cfg_staging_buf));
+    lora_business_ensure_slaves();     /* 出厂后表里只剩配置中的设备(旧条目保留, 不再发) */
+
+    /* ★★2026-10-11 补: 恢复出厂时【cloud_profile 也要回默认】★★
+     * --------------------------------------------------------------------------
+     * 【原来缺什么】`cloud_profile_reset()` 全工程【没有任何调用者】——
+     *   本模块自己的注释(cloud_profile.c 顶部)就写着这件事, 一直没接上。
+     *   ⇒ 后果: 平台发 sys.factory_reset 之后, config_store 那 9 个域确实回默认了,
+     *     **但 cloud_profile 里的 broker / gwId / clientID 还是老的** ——
+     *     现场表现是"恢复了出厂, 但网关还在连原来的 broker / 还用原来的 gwId",
+     *     与"恢复出厂"的语义不符, 而且平台以为设备已经干净了。
+     *
+     * 【为什么放在这里(落盘成功之后)】
+     *   与 config_store 一个口径: **先确认 Flash 落盘成功, 再动运行期状态**。
+     *   前面任何一步失败都会 return 1007、当前配置一个字不改 —— cloud_profile
+     *   也【不能】先重置, 否则会出现"config 没回默认、profile 却回默认了"的分裂状态。
+     *
+     * 【为什么不用管持久化】cloud_profile_reset() 自己只清内存里的 s_profile/s_loaded
+     *   (见 cloud_profile.c), 下次用到时按出厂默认重新装载 —— 不需要额外写 Flash。
+     *
+     * ⚠️ 与 keepNetwork 无关: 那说的是 config_store.network 域; cloud_profile 是
+     *   另一份(连到哪个 broker/用哪个 gwId), 恢复出厂就该一起回默认。 */
+    cloud_profile_reset();
+    log_info("[CLOUD] sys.factory_reset: cloud_profile 已一并回出厂默认(broker/gwId/clientID)\r\n");
+
+    /* ★★2026-11-11 补: 待补报队列必须一起清★★
+     * --------------------------------------------------------------------------
+     * 【原来缺什么】telemetry_cache / event_cache 的 reset 全工程【没有调用者】。
+     *   以前是纯 RAM, 重启就没了, 看不出来; 现在改成掉电保留(方案 A), 这个洞就
+     *   变成了真事故: 网关恢复出厂、换到另一个账号后, 开机仍会把【上一位用户】
+     *   断网期间攒的遥测/事件补报给新账号 —— 数据串号, 而且平台看不出异常。
+     *
+     * 【为什么放在这里(配置与 profile 都已提交之后)】
+     *   与它们同一口径: 前面任何一步失败都会 return 1007、状态一个字不改,
+     *   缓存也不能先清 —— 否则会出现"配置没回默认、历史却被清光"的分裂状态。
+     *
+     * 【清的是什么】只把两个环的 head/tail 归零并落 META(不擦数据区);
+     *   Flash 不在时是空操作。 */
+    telemetry_cache_reset();
+    event_cache_reset();
+    log_info("[CLOUD] sys.factory_reset: 待补报队列已清空(遥测/事件), 不会把旧账号的数据补报给新账号\r\n");
+
+    log_info("[CLOUD] sys.factory_reset 完成: keepNetwork=%s, configVersion=0, "
+              "sensors=%u devices=%u 其余域已回出厂默认\r\n",
+             keep_network ? "true" : "false",
+             (unsigned)config_store_get()->sensor_count,
+             (unsigned)config_store_get()->device_count);
+
+    /* 文档这一条的响应只有 code 0, 没有 data 字段 —— 所以这里不往里写任何成员。 */
+    (void)data;
+    return CLOUD_EC_OK;
+}

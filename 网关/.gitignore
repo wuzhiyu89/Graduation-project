@@ -1,0 +1,71 @@
+# Keil MDK build outputs
+Objects/
+Listings/
+build/
+*.axf
+*.hex
+*.bin
+*.htm
+*.map
+*.dep
+*.d
+*.o
+*.crf
+*.dni
+*.build_log.htm
+*.iex
+*.lst
+*.m51
+*.m66
+*.orc
+*.sbr
+*.lst
+*.i
+*.lnp
+
+# Keil GUI / user-specific
+*.uvguix.*
+*.uvoptx
+JLinkLog.txt
+JLinkSettings.ini
+*.scvd
+EventRecorderStub.scvd
+
+# IDE
+.vscode/
+.eide/
+.trae/
+.cmsis/
+.pack/
+
+# Backup files
+*.bak*
+*.backup
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+/log/
+
+# Temp
+*.tmp
+*~
+
+# WorkBuddy / agent tool state (not project source)
+.workbuddy/
+.dsh-ops/
+__pycache__/
+*.pyc
+
+# Host test binaries (built by _host_test/run.ps1)
+_host_test/*.exe
+
+# OTA host-test fixture: must be exactly these bytes (test_md5/test_ota_http
+# assert its size + MD5), so it is tracked despite the *.bin rule above.
+!_ota_platform_test/fw_test.bin
+
+# 串口发送用的临时命令文件(_send_cmd.ps1 读它)
+_host_test/_cmd.txt

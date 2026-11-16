@@ -1,0 +1,12 @@
+# 内部协作数据，不上传
+.workbuddy/
+
+# 忽略两个子项目各自的 .git（以普通文件/目录形式加入，不作为 submodule）
+网关/.git/
+液位/.git/
+
+# 操作系统临时文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp

@@ -1,0 +1,906 @@
+/**
+ * \file  lora_business.c
+ * \brief LoRa 业务层入口 —— 帧分发 / 0x02 上报 / 失联检测 / init / poll
+ *
+ * 2026-10-18 拆分后，links/lora 下按职责分文件（跨文件接口见 lora_internal.h）：
+ *   lora_slave.c     从机表：hex 工具 / 装载 / 增删 / 在线状态
+ *   lora_bind.c      0x04 绑定窗口状态机
+ *   lora_unbind.c    0x05 解绑两阶段状态机
+ *   lora_alarm.c     0x03 执行结果状态机 + 档位联动下发
+ *   lora_downlink.c  下发队列：投递 / 空口发送 / ACK 重传 / MQTT 下行
+ *   lora_field.c     出厂字段 0x06 / 0x07 / 0x08
+ *   lora_proto.c     帧编解码 / CRC / 射频收发
+ *   本文件保留：on_frame 分发、0x02 上报处理、失联检测、0x80~0x83 应答分发、
+ *                init / poll、射频健康状态。
+ *
+ * 历史：本文件吸收了原 local_gateway.c 的全部业务逻辑（从机表、ACK 重传、
+ * 指令排队、MQTT 上下行），2026-10 起按上面的分工逐步拆开。
+ *
+ * 下行 payload 约定（2026-09 改版：不再用 JSON）：
+ *   云端直接下发【一整个协议帧的原始二进制】(AA 55 ... CRC)，例如
+ *       AA 55 01 11 00 01 21 00 01 01 07 05 00 0A 00 00 DC 05 98 E0
+ *   ⚠️ 这一处原来写的 CRC 是 38 1B，是错的：CRC 覆盖"版本字节..data 末尾"、
+ *      低字节在前，正确值是 98 E0（crc16_modbus("123456789") 必须 = 0x4B37）。
+ *   收包与校验在 lora_downlink.c 的 lora_mqtt_recv_cb()；旧格式 ASCII hex
+ *   文本保留兼容分支（不以 AA55 开头才走 hex 解码）。
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "lora_business.h"
+#include "lora_internal.h"
+#include "lora_proto.h"
+#include "data_cache.h"
+#include "param_save.h"        /* param_get_ptr() — 网关 UID 从 Flash 参数区读 */
+#include "config_store.h"      /* P2-5 起: cfg_uid_from_bytes / 查上报周期(失联检测) */
+#include "sensor_offline.h"    /* 液位失联判定的纯逻辑(用户补充要求第 3 条) */
+#include "cloud_proto.h"       /* P5 绑定/解绑: cloud_proto_get_now_ts() 用于 config_store 落盘时间戳 */
+#include "level_eval.h"        /* 档位联动: level_gear_*() —— 组帧/选目标是纯逻辑, 在那边单测 */
+/* 2026-10-14: 重绑设备时清该 UID 的历史快照(last_value_clear_uid) —— 新设备不继承旧值 */
+#include "last_value.h"
+
+/* ★★2026-10-18: UID 长度只有一个真相源 ★★
+ * 同一件事在三个头文件里各有一个宏(因为它们互相不 include, 避免循环依赖):
+ *     config_store.h : CFG_UID_BYTES     = 13
+ *     param_save.h   : PARAM_UID_BYTES   = 13
+ *     lora_proto.h   : LORA_UID_BYTES    = 13
+ * ⇒ 这里(同时能看到 CFG_UID_BYTES 与 LORA_UID_BYTES 的唯一地方)用静态断言钉住,
+ *   将来谁只改一处、忘了另外两处, 【编译就失败】, 而不是让帧悄悄错位。
+ *   (param_save 那个宏在 param_save.c 里另有一条断言盯着 —— 那文件看不到 config_store.h。) */
+_Static_assert(CFG_UID_BYTES == LORA_UID_BYTES,
+               "CFG_UID_BYTES and LORA_UID_BYTES must match");
+#include "g4_urc.h"
+#include "g4_at.h"
+#include "bsp_tim.h"
+#include "log.h"
+
+extern void app_event_device_online(const char *uid_hex, bool online);
+
+/* 从机表(g_slave_list / g_slave_count)在 lora_slave.c，绑定/解绑/下发分别在
+ * lora_bind.c / lora_unbind.c / lora_downlink.c，接口见 lora_internal.h。
+ * 本文件只做帧分发、上行业务、失联检测与 init/poll。 */
+static uint32_t g_last_poll_tick;
+/* 网关 UID 在 lora_business_init 里从 param_save 读入 (支持后续本地/云端修改) */
+uint8_t g_gw_uid[CFG_UID_BYTES];
+
+/* ==================== ★2026-10-08: 上行 hex 通道已整体删除 ★ ====================
+ *
+ * 【删掉的是什么】
+ *   原来这里有个 lora_business_publish_report(): 把 0x02 上报帧【整帧原样】组出来、
+ *   转成 ASCII hex、再用 g4_at_mqtt_publish(NULL, ...) 发到那条"默认主题"
+ *   (mod/mod_upload)。那是早期"云端自己解帧"的设计。
+ *
+ * 【为什么删】
+ *   甲方明确要求: 不再使用 mod/mod_upload, 历史残留一并清除。
+ *   而且它本来就和 mod/telemetry 是【两条并行的同一份数据】——
+ *   0x02 收到时的 data_cache_up_push() 已经把值写进 last_value 快照表,
+ *   由 main.c 组装成 JSON 走 rt/gw/{gwId}/telemetry 上报。留着那条 hex 通道
+ *   只会让同一份液位在两个主题上各来一遍, 平台侧还要提防"两处数据不一致"。
+ *
+ * 【删干净了哪些地方】(避免以后有人以为还有一条上行)
+ *   · 本文件的 lora_business_publish_report() 与 g_up_hex 缓冲
+ *   · data_cache.c 的 data_cache_poll() 及其调用(lora_business_poll 里那处)
+ *   · g4_at.c 的 G4_MQTT_PUB_TOPIC 宏; 并且 g4_at_mqtt_publish(NULL,...)
+ *     现在【直接返回失败】—— 杜绝换个地方又发到废弃主题上
+ *   · g4_at.c 的 AT+MQTTSUB 默认主题 G4_MQTT_SUB_TOPIC(mod/pc_down)
+ *
+ * 【不存在"数据丢失"】: 0x02 的解析、并入 last_value、以及 ACK 应答全都没动,
+ *   rt/gw/{gwId}/telemetry 的上报路径完全不受影响。
+ * ========================================================================= */
+
+/**
+ * \brief 组装 lora_frame_t 并发送 (用协议层 lora_proto_send_frame)
+ * \return true 成功提交
+ */
+/* 前置声明: 实现在 handle_ack_from_device 之前那段注释下面 */
+static void _schedule_default_level_downlink(const uint8_t dev_uid[CFG_UID_BYTES]);
+
+/* ==================== 液位失联检测(2026-09-27 用户补充要求第 3 条) ====================
+ *
+ * 用户口径: 传感器【最多三个】; 不用断言它还在, 只记录【上次上报时间】;
+ *           每次收到一路液位上报, 就把所有液位从机的上次上报时间拿出来比,
+ *           超过【3 倍上报周期】没上报的, 就向云端发"传感器失联"。
+ *
+ * 【判定/边界/回绕/去重的算法全在 app/service/sensor_offline.c】, 那是一个
+ * 不依赖硬件的纯模块(主机单测直接覆盖); 这里只有状态与胶水。
+ *
+ * 三处口径说明(代码里也标了, 免得以后有人"顺手改一下"改错):
+ *   1) 时间戳一律 get_tick_ms(), 比较必须走 sensor_offline 里的无符号差值 ——
+ *      tick 会回绕, 写 now > last + 阈值 会在回绕那一下判错;
+ *   2) 上报周期取自 config_store 里该 UID 的 reportPeriodSeconds; 查不到 / 没配 (0)
+ *      用 SENSOR_OFFLINE_DEFAULT_PERIOD_S(60s)兜底, 阈值 = 180s;
+ *   3) 只报【跳变】: 在线->失联报一次; 恢复靠它自己的下一次 0x02 上报, 报一次"恢复"。
+ *      失联后不管来多少帧别人的上报都不会重发(offline_reported 挡住)。
+ */
+
+/* 失联/恢复事件的上报回调 —— 真正组事件 JSON + 发 MQTT 的实现在 src/main.c
+ * (本模块不依赖云协议层, 见 lora_business.h 的说明)。不注册只打日志。 */
+static lora_sensor_event_fn g_sensor_event_cb;
+
+void lora_business_set_sensor_event_cb(lora_sensor_event_fn fn)
+{
+    g_sensor_event_cb = fn;
+}
+
+/* ★2026-10-22: 低电量事件回调(平台 lowBatteryPercent 生效) */
+static lora_sensor_low_bat_fn g_low_bat_cb;
+
+void lora_business_set_sensor_low_bat_cb(lora_sensor_low_bat_fn fn)
+{
+    g_low_bat_cb = fn;
+}
+
+/* 按 UID 找该传感器的配置项(找不到返回 NULL) */
+static const cfg_sensor_t *_cfg_sensor_by_uid(const uint8_t uid[LORA_UID_BYTES])
+{
+    const config_store_t *cfg = config_store_get();
+    char    uid_hex[CFG_UID_STR_MAX];
+    uint8_t i;
+
+    if (cfg == NULL) { return NULL; }
+
+    cfg_uid_from_bytes(uid, uid_hex);
+    for (i = 0u; (i < cfg->sensor_count) && (i < (uint8_t)CFG_SENSOR_MAX); i++)
+    {
+        if (strcmp(cfg->sensors[i].uid, uid_hex) == 0)
+        {
+            return &cfg->sensors[i];
+        }
+    }
+    return NULL;
+}
+
+/* ★2026-10-18: 每次液位上报(0x02)的原始数据回调 —— 供主程序做"离线补报" */
+static lora_level_report_fn g_level_report_cb;
+
+void lora_business_set_level_report_cb(lora_level_report_fn fn)
+{
+    g_level_report_cb = fn;
+}
+
+/* 把一次跳变交给上层; 没注册回调时如实打日志(弱网/未挂载时现场要能看出来) */
+static void _sensor_event_fire(const lora_slave_t *s, bool online)
+{
+    char uid[CFG_UID_STR_MAX];
+
+    cfg_uid_from_bytes(s->dev_uid, uid);
+
+    if (g_sensor_event_cb != NULL)
+    {
+        g_sensor_event_cb(uid, online);
+    }
+    else
+    {
+        log_info("[GW] !! 液位 %s %s, 但主程序没注册上报回调 -> 这条事件只记在本机\r\n",
+                 uid, online ? "恢复上报" : "失联");
+    }
+}
+
+void lora_business_check_sensor_offline(void)
+{
+    uint32_t              now_ms = get_tick_ms();
+    const config_store_t *cfg    = config_store_get();
+    uint8_t               i;
+
+    for (i = 0U; i < g_slave_count; i++)
+    {
+        lora_slave_t *s = &g_slave_list[i];
+        char          uid[CFG_UID_STR_MAX];
+        uint16_t      period_s;
+        sensor_offline_action_t act;
+
+        if (s->dev_type != SLAVE_TYPE_SENSOR) { continue; }
+
+        cfg_uid_from_bytes(s->dev_uid, uid);
+        period_s = sensor_offline_period_for_uid(cfg, uid);
+
+        /* got_report = false: 本帧不是它的上报, 只是"顺带检查"。
+         * 它自己上报那条路径在 handle_sensor_report() 里(got_report = true)。 */
+        act = sensor_offline_update_ex(&s->is_online, &s->offline_reported,
+                                       now_ms, s->last_report_tick, period_s, false,
+                                       &s->offline_event_tick);
+
+        if (act == SENSOR_OFFLINE_ACT_REPORT_OFFLINE)
+        {
+            log_info("[GW] 液位 %s 失联: 已 %lums 没有 0x02 上报"
+                     "(阈值 %lums = 上报周期 %us × %u)\r\n",
+                     uid, (unsigned long)(uint32_t)(now_ms - s->last_report_tick),
+                     (unsigned long)sensor_offline_threshold_ms(period_s),
+                     (unsigned)period_s, (unsigned)SENSOR_OFFLINE_PERIOD_MULT);
+            _sensor_event_fire(s, false);
+        }
+    }
+}
+
+/* ---------- 0x02 传感器上报: 拆包 + 上行缓存 + 4G 上报 ---------- */
+static void handle_sensor_report(const lora_frame_t *frame, uint8_t slave_idx,
+                                 int8_t rssi_dbm)
+{
+    /* 载荷 7 字节, 与设备端 app_sensor.c 的 app_sensor_build_level_report() 一一对应:
+     *   [0..1] level_mm   大端 (设备端写的是 (level>>8), (level&0xFF))
+     *   [2]    bat_pct    电量百分比 %
+     *   [3]    month      [4] day      [5] hour      [6] minute   ← 北京时间
+     */
+    if (frame->data_len < 7U) return;
+
+    /* ---- 失联检测: 记下"上次上报时间", 并判断这是不是一次"恢复上报" ----
+     * 【为什么放在长度校验之后】: 长度不对的残帧不算一次有效上报, 否则一台
+     * 一直在发坏帧的设备会被判成"还活着"。
+     * 【为什么不用 last_recv_tick】: 那个是"收到任何帧"都刷新的, 用它判失联会把
+     * "只回 ACK 不上报"的设备永远算成在线(见 lora_business.h 的字段说明)。 */
+    {
+        lora_slave_t *s      = &g_slave_list[slave_idx];
+        uint32_t      now_ms = get_tick_ms();
+        sensor_offline_action_t act;
+
+        s->last_report_tick = now_ms;
+
+        /* got_report = true: 本帧就是这台设备的 0x02 上报。
+         * 这里不需要周期(阈值只用于"没上报"的那一侧), 传 0 不影响结果。 */
+        act = sensor_offline_update_ex(&s->is_online, &s->offline_reported,
+                                       now_ms, s->last_report_tick, 0u, true,
+                                       &s->offline_event_tick);
+        if (act == SENSOR_OFFLINE_ACT_REPORT_ONLINE)
+        {
+            char uid[CFG_UID_STR_MAX];
+
+            cfg_uid_from_bytes(s->dev_uid, uid);
+            log_info("[GW] 液位 %s 恢复上报(之前已判失联, 发一条恢复事件)\r\n", uid);
+            _sensor_event_fire(s, true);
+        }
+    }
+
+    const uint8_t *d = frame->data;
+    uint16_t level_mm  = ((uint16_t)d[0] << 8) | (uint16_t)d[1];   /* 大端 */
+    uint8_t  bat_pct   = d[2];    /* 注意: 旧 local_gateway 里叫 bat_mv(电压), 协议里实际是电量% */
+    /* ★2026-10-29 (协议 V0.5): 低电量事件【不做越限沿去抖】★
+     * 口径(协议 §7.4 / 配置 §3.3): 电量 <= lowBatteryPercent 即上报;
+     *   **低电期间每次该设备上报均重发**(跟随 reportPeriodSeconds),
+     *   **告警收敛由平台负责**(聚合展示、推送静默)。
+     * 所以原来的 low_bat_reported 边沿位 + 5% 回差【已删除】——
+     *   平台不依赖固件去抖, 固件多报不会造成误报, 少报反而会漏。
+     * 阈值 0 = 禁用。
+     * ⚠️ 与"断线期间同一设备只留最新一条"不矛盾: 那是**缓存容量**策略
+     *   (见 event_cache_push_latest), 管的是离线时别把 256 条槽位刷满;
+     *   在线时每包都发, 一条不少。 */
+    {
+        const cfg_sensor_t *cs = _cfg_sensor_by_uid(frame->dev_uid);
+        uint16_t            thr = (cs != NULL) ? (uint16_t)cs->low_battery_pct : 0u;
+
+        if ((thr > 0u) && (bat_pct <= thr))
+        {
+            char uid[CFG_UID_STR_MAX];
+
+            cfg_uid_from_bytes(frame->dev_uid, uid);
+            log_info("[GW] 液位 %s 低电量: %u%% <= 阈值 %u%%, 上报 low_voltage 事件\r\n",
+                     uid, (unsigned)bat_pct, (unsigned)thr);
+            if (g_low_bat_cb != NULL)
+            {
+                g_low_bat_cb(uid, (uint8_t)bat_pct);
+            }
+        }
+    }
+
+    /* 【时间不用液位报的, 用 4G 的】—— 现场要求
+     *   液位自己的 RTC 常年可能是没校时的(现场日志里它一直打 "NOT-SYNCED",
+     *   上报的 4 个时间字节全是 00), 所以【不能相信它的时间】。
+     *   规则: 【收到液位上报之后, 向 4G 模块取时间】来组这一帧。
+     *   这里只要 月/日/时/分 4 个字节(协议里网关上报的载荷布局)。
+     *   取不到(模组没在网/忙)时退回用液位报的那个, 但把告警打出来 ——
+     *   宁可时间可能不准, 也不该把整条液位记录丢掉。 */
+    uint8_t    mo, dd, hh, mi;
+    g4_clock_t clk;
+
+    if (g4_at_get_clock(&clk))
+    {
+        mo = clk.month; dd = clk.day; hh = clk.hour; mi = clk.minute;
+    }
+    else
+    {
+        mo = d[3]; dd = d[4]; hh = d[5]; mi = d[6];
+        log_info("[LoRa UP] !! 取不到 4G 时间(AT+CCLK?) -> 这一条退回用液位报的时间\r\n");
+    }
+
+    /* 打包成 0xMMDDHHMM: cache_up_item_t.time_mdhhm 与
+     * lora_business_publish_report() 都按 字节0=月 字节1=日 字节2=时 字节3=分 解读。 */
+    uint32_t time_mdhhm = ((uint32_t)mo << 24) | ((uint32_t)dd << 16)
+                        | ((uint32_t)hh << 8)  |  (uint32_t)mi;
+
+    log_info("[LoRa UP] dev=%02X%02X%02X level=%umm bat=%u%% time=%02u-%02u %02u:%02u(4G)"
+             " | 液位自报 %02u-%02u %02u:%02u(不用)\r\n",
+             frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
+             (unsigned)level_mm, (unsigned)bat_pct,
+             (unsigned)mo, (unsigned)dd, (unsigned)hh, (unsigned)mi,
+             (unsigned)d[3], (unsigned)d[4], (unsigned)d[5], (unsigned)d[6]);
+
+    /* 1. 存入上行缓存 —— 【上行只有这一个出口】:
+     *    lora_business_poll() 里的 data_cache_poll() 会在 4G 在线时取出、
+     *    组帧、发 MQTT, 发成功了才出队。
+     *
+     *    这里【故意不再】"立即发一遍": 以前既立即发又让 data_cache_poll 发,
+     *    同一份数据发两次; 而且两次都去抢模组的 g_pub_pending, 抢输的那次
+     *    直接 SYS_ERR(记录已被 pop) —— 现象就是"液位偶尔少一条"。 */
+    data_cache_up_push(frame->dev_uid, level_mm, bat_pct, time_mdhhm, rssi_dbm);
+
+    /* ★2026-10-18: 通知主程序"又收到一条液位上报" —— 它会在 4G 离线时把这条
+     *   存进 telemetry_cache, 重连后按【此刻】的时间戳逐条补报。
+     *   与上一行的分工: 上行 data_cache_up_push 是 last_value 快照的漏斗(在线
+     *   聚合遥测要用), 这一条是"离线补报"的漏斗, 两者互不影响。
+     *   放在长度校验之后 —— 残帧不算一次有效上报(否则补报里会混进垃圾值)。 */
+    if (g_level_report_cb != NULL)
+    {
+        g_level_report_cb(frame->dev_uid, level_mm, (uint8_t)bat_pct, rssi_dbm);
+    }
+
+    /* 2. 液位告警检测 (暂留空, 未对接 local_alarm)
+     *   if (level_mm > threshold) lora_business_send_req(slave->dev_uid, SLAVE_TYPE_ALARM_OUT,
+     *                                                     LORA_FUNC_SET_ALARM, alarm_payload, len); */
+
+    /* 3. 给这台液位传感器补一条"本地默认参数"进下发缓存
+     *    见下面 LORA_LEVEL_PUSH_DEFAULT 那段说明。 */
+    _schedule_default_level_downlink(frame->dev_uid);
+
+    /* 4. 用户口径: 【每收到一路液位上报, 就顺带检查全部液位从机】是否失联。
+     *    刚才这台已经在上面的 sensor_offline_update() 里刷过时间戳, 不会被误判;
+     *    这里检查的是"别人"。不另起定时器。
+     *    本函数在主循环路径上被调用(lora_proto_poll → on_frame), 不在中断上下文。 */
+    lora_business_check_sensor_offline();
+
+    (void)slave_idx;
+}
+
+/* ---------- 液位传感器: 上报后补一条默认参数进下发缓存 ----------
+ *
+ * 【2026-09 云端改成下发协议帧后, 这个默认值仍然默认【关闭】】
+ *   正常路径是云端下发 0x01 帧, 载荷里的校时取自 AT+CCLK?(模组在网才有)。
+ *   4G 不在网时按约定【不下发 0x01】, 而不是拿一个写死的时间去骗设备。
+ *   这里保留开关只是给"纯 LoRa 台架、完全没有 4G"时应急用:
+ *   打开后会在设备上报且下发缓存为空时补一条固定参数(含写死的时间)。
+ *
+ * 【什么时候补】只在该设备下发缓存为空时补(非破坏性 fetch 查)。
+ * 云端刚下发过参数就按云端的走, 不覆盖。
+ *
+ * ⚠️ 打开后设备 RTC 每轮上报都会被校到下面那个固定时间。
+ *
+ * 载荷布局(18 字节, 小端, 与设备端 app_cmd.h / app_cmd.c 完全一致):
+ *   off0-2 上报间隔 1800 秒 = 30 分钟 -> 0x000708
+ *   （★单位是【秒】, 网关不换算, 设备端也按秒用 —— 见 LORA_SENSOR_PERIOD_MIN_S ★）
+ *   off3   相同液位上报 1
+ *   off4-5 液位告警阈值 50mm -> 0x0032
+ *   off6   测量模式 0=液位 1=距离
+ *   off7-8 安装高度 cm  off9-10 校准偏移 mm(int16)  off11 低电量阈值%
+ *   off12 year off13 month off14 day off15 week off16 hour off17 minute
+ *   ⚠️ 16 位字段必须【低字节在前】, 写成大端会被设备解成 512/256/62465 这种乱值。
+ *   ★2026-10-22: 取消检测间隔、上报间隔扩到 3 字节、新增 4 个设备侧参数
+ *   -> 原 13 字节变 18 字节。
+ */
+#ifndef LORA_LEVEL_PUSH_DEFAULT
+#define LORA_LEVEL_PUSH_DEFAULT   0     /* 1 = 台架无 4G 时补固定参数 */
+#endif
+
+/* 单位【秒】(2026-10-05 改版, 与上面的 LORA_SENSOR_PERIOD_MIN_S 同一口径):
+ *   上报间隔 1800s = 30 分钟, 阈值 50mm; 其余设备侧参数取中性默认值。 */
+static const uint8_t LORA_LEVEL_DEFAULT_DATA[18] =
+{
+    0x08U, 0x07U, 0x00U,  /* off0-2  上报间隔 1800 秒 = 30 分钟 (0x000708 小端) */
+    0x01U,               /* off3    相同液位也上报(协议固定 1) */
+    0x32U, 0x00U,        /* off4-5  告警阈值 50mm (0x0032 小端) */
+    0x00U,               /* off6    测量模式 0=液位 */
+    0x00U, 0x00U,        /* off7-8  安装高度 0cm */
+    0x00U, 0x00U,        /* off9-10 校准偏移 0mm */
+    0x00U,               /* off11   低电量阈值 0 = 禁用 */
+    26U, 9U, 18U, 5U, 13U, 25U   /* off12-17 校时: 2026-09-18 周五 13:25 */
+};
+
+static void _schedule_default_level_downlink(const uint8_t dev_uid[CFG_UID_BYTES])
+{
+#if LORA_LEVEL_PUSH_DEFAULT
+    cache_down_item_t probe;
+
+    /* 已经有待发指令(云端刚下发的)就不动它 */
+    if (data_cache_down_fetch_by_uid((uint8_t *)dev_uid, &probe))
+    {
+        return;
+    }
+
+    if (lora_business_send_req(dev_uid, SLAVE_TYPE_SENSOR, LORA_FUNC_SET_SENSOR_PARAM,
+                               LORA_LEVEL_DEFAULT_DATA,
+                               (uint8_t)sizeof(LORA_LEVEL_DEFAULT_DATA)) == 0)
+    {
+        log_info("[GW] 该设备下发缓存为空, 已补一条默认 0x01 参数(1800s/50mm), "
+                 "稍后随应答一起下发\r\n");
+    }
+    else
+    {
+        log_info("[GW] !! 默认参数补入下发缓存失败(缓存满/载荷过长)\r\n");
+    }
+#else
+    (void)dev_uid;
+#endif
+}
+
+/* ---------- 0x80 / 0x81 从机 ACK 应答: 更新状态 + 清除下发缓存 ---------- */
+/* ==========================================================================
+ * ★★2026-10-08 新增: 声光(0x03)执行结果的上报与重试(用户 A1/A3)★★
+ * --------------------------------------------------------------------------
+ * 用户口径:
+ *   · 发出去后 15 秒内要收到 0x82(成功) 或 0x83(失败);
+ *   · 超时算失败, 0x83 也算失败, 【都要计数并重发】;
+ *   · 【总共发 3 条】(首次 + 2 次重试);
+ *   · 3 条都没成功 ⇒ 上报"声光报警器离线"。
+ * ======================================================================== */
+
+/* 声光的超时/次数/间隔宏定义在文件前半(见 lora_tx_downlink 之前),
+ * 因为发送咽喉也要用它们 —— 这里不再重复定义。 */
+
+static void handle_ack_from_device(const lora_frame_t *frame, uint8_t slave_idx)
+{
+    /* 【g_unbind 拦截】解绑期间目标 slave 的 ack 由 g_unbind 状态机接管,
+     *   不走下面的 data_cache / lora_reply_schedule 旧逻辑。
+     *   必须在 s->state 检查之前拦: 解绑 slave 一直是 WAIT_ACK(锁), 旧逻辑
+     *   会判成"等 ACK 状态"然后走进去误处理; 这里先把 g_unbind 在跟踪的 ack
+     *   路由到 lora_unbind_on_ack, 由状态机按阶段1/阶段2 语义处理(收到 ack 不一定
+     *   是成功 —— 阶段2 收到 ack 反而是失败)。 */
+    if (lora_unbind_owns_ack(slave_idx))
+    {
+        (void)frame;   /* ack 内容不区分 0x80/0x81, 都视为设备应答 */
+        lora_unbind_on_ack();
+        return;
+    }
+
+    /* ★2026-10-18: 字段写(0x06)的 ack 归属 —— 必须在 slave 状态机之前判。
+     *   字段操作【不走】SLAVE_STATE_WAIT_ACK(state 一直是 IDLE), 否则下面
+     *   那句 `if (s->state != SLAVE_STATE_WAIT_ACK) return;` 会把 0x80 丢掉,
+     *   于是"设备明明确认了, 串口却一直等到 3 次发完报失败"。
+     *   0x80 = 写成功; 0x81 = 设备明确拒绝(立即判失败, 不再等剩下两条)。 */
+    if (lora_field_on_ack(frame))
+    {
+        return;
+    }
+
+    lora_slave_t *s = &g_slave_list[slave_idx];
+    if (s->state != SLAVE_STATE_WAIT_ACK) return;   /* 不是等 ACK 状态, 忽略 */
+
+    /* ★0x09 在线查询的 ACK: 只更新在线状态, 不走 0x03 的结果状态机★ */
+    if (s->pending_func == (uint8_t)LORA_FUNC_PING_ALARM)
+    {
+        char uid_hex[CFG_UID_STR_MAX];
+
+        s->state     = SLAVE_STATE_IDLE;
+        s->retry_cnt = 0U;
+        (void)data_cache_down_del_if_match(s->dev_uid, s->pending_func,
+                                           s->pending_data, s->pending_data_len);
+        if (s->alarm_offline_reported)
+        {
+            s->alarm_offline_reported = false;
+            (void)cfg_uid_from_bytes(s->dev_uid, uid_hex);
+            app_event_device_online(uid_hex, true);
+            log_info("[GW] 声光 %s 0x09 ACK -> 恢复在线\r\n", uid_hex);
+        }
+        return;
+    }
+
+    /* ==========================================================================
+     * ★★2026-10-08: 声光(0x03)是"三段式"应答, 0x80 不再是终态★★
+     * --------------------------------------------------------------------------
+     * 设备对 0x03 回两条:
+     *     立即       0x80  = "我收到了"(不是执行成功!)
+     *     约10秒后   0x82  = 执行成功   /   0x83 = 执行失败
+     * 【为什么必须按 pending_func 分流】0x01(设液位参数)等其它功能码没有第二段,
+     *   它们的 0x80 就是终态。把 0x80 一律当"还没完成"会让那些命令永远等不到结果。
+     * ======================================================================== */
+    if (s->pending_func == (uint8_t)LORA_FUNC_SET_ALARM)
+    {
+        if (frame->func == (uint8_t)LORA_FUNC_RESP_OK)          /* 0x80: 只是收到了 */
+        {
+            /* 【不结束】继续等 0x82/0x83; 但刷新一下时间戳 ——
+             * 设备明确回话了, 说明链路是通的, 给它重新算 15 秒更公平。 */
+            s->alarm_tick = get_tick_ms();
+            log_info("[GEAR] %02X%02X%02X 已收下指令(0x80), 继续等执行结果(0x82/0x83)\r\n",
+                     s->dev_uid[0], s->dev_uid[1], s->dev_uid[2]);
+            return;
+        }
+        if (frame->func == (uint8_t)LORA_FUNC_ALARM_DONE)       /* 0x82: 成功 */
+        {
+            s->state          = SLAVE_STATE_IDLE;
+            s->retry_cnt      = 0U;
+            s->alarm_pending  = false;
+            s->alarm_attempts = 0U;
+            /* ★2026-10-23 P1: 改成"条件删除"★
+             * 0x80 到 0x82 大约 10 秒, 云端完全可能在这期间下发【新档位】,
+             * 而缓存是"每台一条"(后到顶掉前到)。以前这里按 uid 无条件删,
+             * 把那条新指令一起删掉了 —— 平台以为成功、设备停在旧档位,
+             * 且不会再重试。现在只有"缓存里还是刚发出去的那条"才删。 */
+            if (!data_cache_down_del_if_match(s->dev_uid, s->pending_func,
+                                              s->pending_data, s->pending_data_len))
+            {
+                log_info("[GEAR] %02X%02X%02X 已有一条更新的指令在缓存里, 保留待发\r\n",
+                         s->dev_uid[0], s->dev_uid[1], s->dev_uid[2]);
+            }
+            log_info("[GEAR] ★%02X%02X%02X 执行成功(0x82)★ 档位 %u\r\n",
+                     s->dev_uid[0], s->dev_uid[1], s->dev_uid[2], (unsigned)s->alarm_gear);
+            /* ★2026-10-18 (丙): 之前判过离线? 这一拍成功就是"恢复" ★
+             * 带 recovered=true 回调, 主程序会补一条 event.device{"online"}。 */
+            {
+                bool was_offline = s->alarm_offline_reported;
+
+                s->alarm_offline_reported = false;
+                lora_alarm_fire_result(s, true, false, was_offline);
+            }
+            return;
+        }
+        if (frame->func == (uint8_t)LORA_FUNC_ALARM_FAIL)       /* 0x83: 失败 */
+        {
+            log_info("[GEAR] %02X%02X%02X 回执行失败(0x83), 第 %u/3 条\r\n",
+                     s->dev_uid[0], s->dev_uid[1], s->dev_uid[2],
+                     (unsigned)s->alarm_attempts);
+            lora_alarm_on_fail(s);
+            return;
+        }
+        return;     /* 其它功能码: 不动这个状态机 */
+    }
+
+    s->state       = SLAVE_STATE_IDLE;
+    s->retry_cnt   = 0U;
+
+    if (frame->func == LORA_FUNC_RESP_OK)
+    {
+        /* 成功 —— 清除下发缓存(★条件删除: 等待 ACK 期间云端可能已下发新指令,
+         * 无条件按 uid 删会把那条新的连带删掉, 见 data_cache.h 的说明) */
+        if (!data_cache_down_del_if_match(s->dev_uid, s->pending_func,
+                                          s->pending_data, s->pending_data_len))
+        {
+            log_info("[GW] %02X%02X%02X 已确认, 但缓存里是更新的指令 -> 保留待发\r\n",
+                     s->dev_uid[0], s->dev_uid[1], s->dev_uid[2]);
+        }
+    }
+    /* 如果是 ERR —— 保留缓存, 让下次设备上报时 lora_try_send_downlink 再发 */
+}
+
+/* ========== 业务帧分发 (注册给协议层的 LoraFrameCallback_t) ========== */
+
+
+/* ==================================================================
+ * ★2026-10-18: UID 尺寸【静态断言】—— 防止"改了长度忘改缓冲"再次发生
+ * ==================================================================
+ *     声明 3 字节数组, 却 memcpy 13 字节 ⇒ 越界写坏别的全局变量 +
+ *     发出去的帧地址是垃圾, 而【编译期零告警、主机单测也测不到】,
+ *     只有上板收发才会暴露。
+ * 【为什么编译器抓不到】数组作函数参数会退化成指针, memcpy 的形参是 void* ——
+ *   这一整条链路上没有任何类型/尺寸检查。
+ * ⇒ 所以在这里把"存 UID 的结构体成员 / 文件级静态数组"的尺寸【钉死】。
+ *   以后谁再改 UID 长度而漏改某个缓冲, 【这里编译就失败】, 不用等上板。
+ * ================================================================== */
+_Static_assert(sizeof(((lora_frame_t *)0)->gw_uid)        == CFG_UID_BYTES,
+               "lora_frame_t.gw_uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((lora_frame_t *)0)->dev_uid)       == CFG_UID_BYTES,
+               "lora_frame_t.dev_uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((lora_slave_t *)0)->dev_uid)       == CFG_UID_BYTES,
+               "lora_slave_t.dev_uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((cache_down_item_t *)0)->dev_uid)  == CFG_UID_BYTES,
+               "cache_down_item_t.dev_uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((device_param_t *)0)->gw_uid)      == CFG_UID_BYTES,
+               "device_param_t.gw_uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((param_slave_uid_t *)0)->uid)      == CFG_UID_BYTES,
+               "param_slave_uid_t.uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(((last_value_t *)0)->uid)           == CFG_UID_BYTES,
+               "last_value_t.uid 必须等于 CFG_UID_BYTES");
+_Static_assert(sizeof(g_gw_uid)              == CFG_UID_BYTES, "g_gw_uid 必须 13 字节");
+/* (tc_record_t / ec_record_t 的断言放在各自的 .c 里 —— 本文件不 include 那两个头) */
+
+/* 地址是否是广播(全 FF) —— 设备"没绑任何网关"时帧头里的 gw 字段 */
+static bool _uid_is_broadcast(const uint8_t uid[CFG_UID_BYTES])
+{
+    uint8_t i;
+
+    for (i = 0u; i < CFG_UID_BYTES; i++)
+    {
+        if (uid[i] != 0xFFu) { return false; }
+    }
+    return true;
+}
+
+static void on_frame(const lora_frame_t *frame, int8_t rssi, int8_t snr)
+{
+    if (frame == NULL) return;
+
+    /* 收到什么就打什么: 帧头/地址/功能码/原始字节, 台架联调排障全靠它 */
+    log_info("[LoRa RX] rssi=%d snr=%d gw=%02X%02X%02X dev=%02X%02X%02X func=0x%02X dlen=%u len=%u:",
+             (int)rssi, (int)snr,
+             frame->gw_uid[0], frame->gw_uid[1], frame->gw_uid[2],
+             frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
+             frame->func, (unsigned)frame->data_len, (unsigned)frame->raw_len);
+    for (uint8_t i = 0U; i < frame->raw_len; i++)
+    {
+        log_info(" %02X", frame->raw[i]);
+    }
+    log_info("\r\n");
+
+    /* ============ 绑定窗口拦截(P5, LoRa 0x04) ============
+     * 必须在 lora_slave_touch / 白名单之前 —— 0x04 绑定请求的目标地址是广播
+     * FFFFFF, dev_uid 是发起绑定的设备自己, 它还不在从机表里, 会被白名单
+     * 丢弃。这里先拦下来走 lora_bind_handle_0x04, 由状态机决定是回 0x80 进入
+     * 握手还是回 0x81 拒绝。
+     *
+     * 同样, 在 BIND_WAIT_DEV_ACK 期间, 对端回的 0x80 是"对 0x04 的确认",
+     * 不能再走 handle_ack_from_device(那个是处理"对 0x01/0x03 下发的 ACK")。
+     */
+    if (lora_bind_accepts_0x04() && (frame->func == LORA_FUNC_BIND_REQ))
+    {
+        lora_bind_handle_0x04(frame);
+        return;
+    }
+    if ((frame->func == LORA_FUNC_RESP_OK) && lora_bind_waiting_dev_ack(frame->dev_uid))
+    {
+        lora_bind_handle_dev_ack(frame);
+        return;
+    }
+
+    /* ==========================================================================
+     * ★★2026-10-08 修: 配对窗口【没开】时收到 0x04 —— 一律丢弃, 【绝不回 ACK】★★
+     * --------------------------------------------------------------------------
+     * 【现场现象(用户报告)】声光报警器解绑完之后不是关机, 而是进入"等待绑定"状态,
+     *   于是它会持续发 0x04 绑定请求。而网关【给它回了 0x80】—— 设备会以为自己
+     *   又被绑上了(或者反过来导致它一直停在绑定态)。
+     *
+     * 【为什么会回】原来的路径是:
+     *     1615 行: 窗口没开 -> 不走配对状态机
+     *     1629 行: lora_slave_touch() 摸一下 -> 如果这台设备【还在从机表里】, idx 有效
+     *     1648 行: 通用 ACK 分支对"除 0x80/0x81 之外的所有 func"都回 ACK
+     *   ⇒ 0x04 就搭上了这趟车。而 0x04 的语义是"我想加入", 不是一个业务请求 ——
+     *     它【只】该由配对窗口状态机应答; 窗口没开就代表"没人在等它"。
+     *
+     * 【为什么必须早于 lora_slave_touch 拦】lora_slave_touch 的副作用是"标记在线 + 刷新时间戳",
+     *   对一台刚被解绑的设备做这件事本身就会污染在线状态。
+     *
+     * 【为什么不顺手回 0x81(拒绝)】设备端没定义"绑定被拒"的处理路径, 回了反而可能
+     *   让它改变状态。静默丢弃是最安全的: 设备该怎么退绑定态是【设备侧】的事。
+     * ⚠️ 现场若看到这行日志反复刷, 说明设备一直在求绑定 —— 那是设备侧的问题
+     *   (解绑后没关机/没退出绑定态), 需要设备侧修, 不是网关能替它解决的。 */
+    /* ★2026-11-03: 解绑中的设备发 0x04(gw=广播) = 它已经把网关值清成 FFFFFF 了★
+     * 设备清完会立刻重启并发 0x04 找新网关(实测 2~3s 后就开始)。这是确定的证据,
+     * 比"阶段2 等 2 个上报周期静默"(默认 10 分钟)快得多 —— 当场判解绑成功。
+     * 必须放在下面那条"窗口没开就丢弃"之前, 否则这条证据被吞掉。 */
+    if ((frame->func == LORA_FUNC_BIND_REQ) && _uid_is_broadcast(frame->gw_uid))
+    {
+        uint8_t uidx = lora_slave_find(frame->dev_uid);
+
+        if ((uidx != 0xFFU) && lora_unbind_owns_ack(uidx))
+        {
+            lora_unbind_dev_cleared();
+            return;
+        }
+    }
+
+    if (frame->func == LORA_FUNC_BIND_REQ)
+    {
+        log_info("[BIND] 收到 %02X%02X%02X 的绑定请求(0x04), 但配对窗口未开"
+                 " —— 丢弃, 不回 ACK(避免设备误以为已绑定)\r\n",
+                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2]);
+        return;
+    }
+
+    /* 在从机表里"摸一下"这台设备(标记在线 + 记时间戳)。 */
+    uint8_t idx = lora_slave_touch(frame->dev_uid);
+
+    /* 【白名单】: 地址不在从机表里 -> 只打印, 一律丢弃。
+     * 不回 ACK、不解析载荷、不入缓存 —— 陌生设备在这一层就被挡住。
+     * ⚠ 0x04 绑定请求是特例(目标地址=广播 FFFFFF, dev_uid 是发起绑定的设备自己,
+     *   不在表里) —— 步骤4 要在 lora_slave_touch 之前先判 func==0x04 且在绑定窗口,
+     *   直接走 0x04 分支, 否则会被这里白名单丢弃。 */
+    if (idx == 0xFFU)
+    {
+        log_info("[GW] !! 未知从机 %02X%02X%02X (不在从机表里), 丢弃该帧\r\n",
+                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2]);
+        return;
+    }
+
+    /* 【不再立刻回】只登记, 由 lora_reply_logic() 等 3s 后回 ACK, 再等 3s 下发指令。
+     *
+     * ⚠️【0x80/0x81 绝不能回】: 那是"对方在应答我们下发的那条指令"。
+     *    如果连它也要回一个 ACK, 两边就会互相 ACK 永远停不下来
+     *    (设备侧一旦也这么实现, 空口就被这两帧刷满, 正常业务全被挤掉)。
+     *
+     * ★★2026-10-10: 0x82/0x83 同样【绝不能回】★★
+     *   它们和 0x80/0x81 是同一类东西 —— "设备在应答/汇报我们下发的那条指令"。
+     *   给它们回 ACK 就是同一场 ACK 风暴。
+     *   (现场 2026-10-10: 声光回了 0x82, 走 default 打"未处理的功能码" —— 因为
+     *    下面的 switch 里根本没有它的 case, 所以既没处理、也差点被这条 if 排上 ACK。) */
+    if ((frame->func != LORA_FUNC_RESP_OK)    && (frame->func != LORA_FUNC_RESP_ERR) &&
+        (frame->func != LORA_FUNC_ALARM_DONE) && (frame->func != LORA_FUNC_ALARM_FAIL) &&
+        /* ★2026-10-18: 0x08(字段应答)也【不走】3 秒延迟 ACK ——
+         * 设备侧等 ack 的窗口只有 5 秒, handle_field_resp() 里已经【立刻】回了。 */
+        (frame->func != LORA_FUNC_FIELD_RESP))
+    {
+        lora_reply_schedule(frame->dev_uid, frame->func, idx);
+    }
+
+    switch (frame->func)
+    {
+    case LORA_FUNC_SENSOR_REPORT:     /* 0x02 — 液位传感器上报 */
+        handle_sensor_report(frame, idx, rssi);
+        break;
+    case LORA_FUNC_FIELD_RESP:        /* 0x08 — 设备回报出厂字段(必须回 ack) */
+        lora_field_handle_resp(frame, idx);
+        break;
+    case LORA_FUNC_RESP_OK:           /* 0x80 — 从机对我们下发的 ACK_OK */
+    case LORA_FUNC_RESP_ERR:          /* 0x81 — 从机回错误/重传 */
+    case LORA_FUNC_ALARM_DONE:        /* 0x82 — 声光: 执行成功 */
+    case LORA_FUNC_ALARM_FAIL:        /* 0x83 — 声光: 执行失败 */
+        /* ★2026-10-10: 后两个原来【漏了】, 于是 0x82/0x83 掉进 default 被当"未处理"。
+         * 三者都由 handle_ack_from_device 分派:
+         *   0x80 -> 只刷新时间戳(还需要等真正的执行结果)
+         *   0x82 -> 上报 event.action{code=0} 执行成功
+         *   0x83 -> 重发一次 0x03(配额内) */
+        handle_ack_from_device(frame, idx);
+        break;
+    default:
+        /* 未知/暂不处理的功能码 —— ACK 已由 lora_reply_logic() 排上。
+         * ★ 2026-09-27 修复: 原来这里是【静默】的, 结果现场现象是
+         *   "收包计数在涨、日志里却什么都没有", 排障时无从下手。
+         *   现在把功能码打出来 —— 一眼就能看出对端发的是不是我认的那几个。 */
+        log_info("[GW] !! 未处理的功能码 func=0x%02X (只认 0x02=液位上报/0x80=ACK_OK"
+                 "/0x81=ACK_ERR/0x82=声光成功/0x83=声光失败)"
+                 " dev=%02X%02X%02X dlen=%u\r\n",
+                 (unsigned)frame->func,
+                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
+                 (unsigned)frame->data_len);
+        break;
+    }
+
+    /* 注意: 这里【不再】调 lora_try_send_downlink()。
+     * 下发改由 lora_reply_logic() 的第二步做(回完 ACK 再等 3s),
+     * 这样"回 ACK"和"下发指令"两条时间线不会各算各的。 */
+}
+
+
+/* 说明: 原来这里还有一个 lora_business_mqtt_recv() —— 给"日志口手敲一行 payload
+ * 当云端下发"用的台架后门, 已删除: 下行只走 4G/MQTT 这一条路。
+ * 台架上要模拟云端下发, 请直接往 MQTT 下行主题 pub 一条 hex 帧。 */
+
+
+/* ========== 对外 init / poll / API ========== */
+
+void lora_business_init(void)
+{
+    g_last_poll_tick = get_tick_ms();
+
+    /* 1. 从 param_save 读取网关 UID (Flash 里如果还没烧写过会用 param_load_factory_default 的默认值) */
+    param_save_init();
+    device_param_t *p = param_get_ptr();
+    memcpy(g_gw_uid, p->gw_uid, CFG_UID_BYTES);
+
+    /* 2. 装载从机表: 从 config_store 的 sensors[]/devices[] 读进来(uid + 设备类型),
+     *    其余字段清零。运行期还支持 0x04 绑定追加 / 0x05 解绑删除。 */
+    lora_slave_load();
+
+    /* 3. 协议层 init + 注册自己为帧回调 (同时自动开持续 RX) */
+    lora_proto_init(on_frame);
+
+    /* 4. data_cache init */
+    data_cache_init();
+
+    /* 5. 注册 MQTT 下行回调: 云端发的设置指令会转成 LoRa 帧发出去 */
+    g4_urc_set_recv_cb(lora_mqtt_recv_cb);
+}
+
+void lora_business_ensure_slaves(void)
+{
+    const config_store_t *cfg = config_store_get();
+    uint8_t               uid[CFG_UID_BYTES];
+    uint8_t               i;
+
+    if (cfg == NULL) { return; }
+
+    /* 液位传感器 */
+    for (i = 0U; (i < cfg->sensor_count) && (i < (uint8_t)CFG_SENSOR_MAX); i++)
+    {
+        if (!cfg_uid_to_bytes(cfg->sensors[i].uid, uid)) { continue; }
+        if (lora_slave_find(uid) == 0xFFU)
+        {
+            (void)lora_slave_add(uid, SLAVE_TYPE_SENSOR);
+            log_info("[GW] 配置里的液位 %s 不在从机表 -> 运行期补登记\r\n",
+                     cfg->sensors[i].uid);
+        }
+    }
+
+    /* 联动设备(声光等) */
+    for (i = 0U; (i < cfg->device_count) && (i < (uint8_t)CFG_DEVICE_MAX); i++)
+    {
+        if (!cfg_uid_to_bytes(cfg->devices[i].uid, uid)) { continue; }
+        if (lora_slave_find(uid) == 0xFFU)
+        {
+            (void)lora_slave_add(uid, SLAVE_TYPE_ALARM_OUT);
+            log_info("[GW] 配置里的设备 %s 不在从机表 -> 运行期补登记\r\n",
+                     cfg->devices[i].uid);
+        }
+    }
+}
+
+void lora_business_ping_alarms(void)
+{
+    const config_store_t *cfg = config_store_get();
+    static uint32_t       last_ms;
+    uint32_t              now = get_tick_ms();
+    uint8_t               i;
+
+    if (cfg == NULL) { return; }
+
+    /* 合并: 同一秒内多台液位上报只触发一轮 0x09 */
+    if ((last_ms != 0u) && ((uint32_t)(now - last_ms) < 1000u)) { return; }
+    last_ms = now;
+
+    for (i = 0u; (i < cfg->device_count) && (i < (uint8_t)CFG_DEVICE_MAX); i++)
+    {
+        uint8_t              uid[CFG_UID_BYTES];
+        uint8_t              idx;
+        lora_slave_t        *s;
+        cache_down_item_t    it;
+
+        if (cfg->devices[i].enabled == 0u) { continue; }
+        if (!cfg_uid_to_bytes(cfg->devices[i].uid, uid)) { continue; }
+
+        idx = lora_slave_find(uid);
+        if (idx == 0xFFU) { continue; }
+        s = &g_slave_list[idx];
+
+        if (s->state != SLAVE_STATE_IDLE) { continue; }
+
+        /* 缓存里还有 0x03 待发 -> 先发屏显, 不要用 0x09 顶掉 */
+        if (data_cache_down_fetch_by_uid(uid, &it) &&
+            (it.pay_len >= 1u) && (it.payload[0] == (uint8_t)LORA_FUNC_SET_ALARM))
+        {
+            continue;
+        }
+
+        (void)lora_business_send_req(uid, SLAVE_TYPE_ALARM_OUT,
+                                     (uint8_t)LORA_FUNC_PING_ALARM, NULL, 0u);
+    }
+}
+
+void lora_business_poll(void)
+{
+    /* 1. 协议层 poll (radio 中断 + 帧解析 + 分发 on_frame) */
+    lora_proto_poll();
+
+    /* 1.5 收到请求帧后的分两步应答: 等 3s 回 ACK, 再等 3s 下发指令。
+     *     每轮都算(1ms 精度), 只比时间戳, 不阻塞。 */
+    lora_reply_logic();
+
+    /* 1.6 绑定窗口状态机: 每轮都判(1ms 精度), 负责重发 0x80 + 窗口到期处理。
+     *     只在非 IDLE 时有动作, 平常(没开窗口)立即 return, 不影响主循环节拍。 */
+    lora_bind_logic();
+
+    /* 1.7 解绑两阶段状态机: 每轮都判(1ms 精度), 负责阶段1/等15s/阶段2 的
+     *     3s 间隔发 0x05 + 阶段超时/成功/故障处理。只在非 IDLE 时有动作,
+     *     平常立即 return, 不影响主循环节拍。 */
+    lora_unbind_logic();
+
+    /* 2. ACK 超时重传 + 声光报警器主动下发 (周期轮询) */
+    uint32_t now = get_tick_ms();
+    if ((now - g_last_poll_tick) >= LORA_POLL_PERIOD_MS)
+    {
+        g_last_poll_tick = now;
+        lora_downlink_logic();       /* 重传超时的 WAIT_ACK 从机 */
+        lora_try_send_alarm_idle();      /* 扫 IDLE 声光报警器, 捡起缓存的待发指令 */
+        /* ★2026-10-08: 这里原来还调 data_cache_poll()(发 mod/mod_upload 那条 hex 上行)。
+         * 该通道已按甲方要求整体删除, 调用一并去掉 —— 液位走的是 last_value 快照
+         * + main.c 的 rt/gw/{gwId}/telemetry, 与本处无关。 */
+    }
+}
+
+/* ==================== LoRa 射频健康状态 ====================
+ * 实现在 app/drivers/lora/LLCC68N32H482-board.c(射频中间层)。这里用 extern 直接声明, 免得为了
+ * 两个查状态的函数把射频层的头文件引进业务层。 */
+extern uint8_t LLCC68IsStuck(void);
+extern uint8_t LLCC68BusyLevel(void);
+
+uint8_t lora_business_radio_stuck(void)
+{
+    return LLCC68IsStuck();
+}
+
+uint8_t lora_business_radio_busy(void)
+{
+    return LLCC68BusyLevel();
+}
