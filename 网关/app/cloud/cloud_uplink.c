@@ -293,19 +293,10 @@ const char *cloud_proto_serial_of_uid(const char *uid_hex, bool is_sensor)
         return NULL;
     }
 
-    if (is_sensor)
+    (void)is_sensor;    /* 毕设只有液位; 保留形参仅为减少调用点改动 */
+    for (i = 0u; (i < cfg->sensor_count) && (i < (uint8_t)CFG_SENSOR_MAX); i++)
     {
-        for (i = 0u; (i < cfg->sensor_count) && (i < (uint8_t)CFG_SENSOR_MAX); i++)
-        {
-            if (strcmp(cfg->sensors[i].uid, uid_hex) == 0) { return cfg->sensors[i].serial; }
-        }
-    }
-    else
-    {
-        for (i = 0u; (i < cfg->device_count) && (i < (uint8_t)CFG_DEVICE_MAX); i++)
-        {
-            if (strcmp(cfg->devices[i].uid, uid_hex) == 0) { return cfg->devices[i].serial; }
-        }
+        if (strcmp(cfg->sensors[i].uid, uid_hex) == 0) { return cfg->sensors[i].serial; }
     }
     return NULL;
 }
@@ -465,11 +456,8 @@ bool cloud_fill_status_json(cJSON *obj, const cloud_status_t *st)
             (cJSON_AddNumberToObject(obj, "sensorsOnline",
                 (double)st->sensors_online) != NULL) &&
             (cJSON_AddNumberToObject(obj, "sensorsTotal",
-                (double)st->sensors_total) != NULL) &&
-            (cJSON_AddNumberToObject(obj, "devicesOnline",
-                (double)st->devices_online) != NULL) &&
-            (cJSON_AddNumberToObject(obj, "devicesTotal",
-                (double)st->devices_total) != NULL));
+                (double)st->sensors_total) != NULL));
+    /* 毕设版: devicesOnline/devicesTotal 已随一体机删除 */
 }
 
 uint16_t cloud_proto_build_status_data(char *out, uint16_t cap, const cloud_status_t *st)

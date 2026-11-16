@@ -63,42 +63,37 @@ bool app_epoch_valid(void)
 }
 
 /* ==================================================================
- * 最近一次边缘评估结果(给状态上报 / 遥测取【实时】档位与状态)
+ * 最近一次有效水位算出的状态/档位(给 status / telemetry 打标签)
  * ==================================================================
- * 【为什么要缓存它】level_supervisor 只对外给 poll()/mark_sent()/mark_event(),
- * 没有"当前档位"的 getter。而 status.report 与 telemetry 都需要【实时】档位。
- * 以前这里是硬编码: st->mode="auto"、st->current_gear=0 —— 于是平台看到的档位
- * 永远是 0(哪怕现场已经红灯禁行)。2026-09-30 第 10 条一并修掉。
- * ★ 纯 RAM, 不写 Flash(用户第 14 条决定: 网关不会断电)。 */
-static level_decision_t s_last_ld;
-static bool             s_last_ld_valid = false;
+ * 毕设版只有液位传感器: 水位上报路径在拿到有效水位时算好状态(level_state_t)
+ * 和档位, 通过 app_note_level() 存这里; status.report 与 telemetry 读取展示。
+ * ★ 纯 RAM, 不写 Flash。 */
+static uint8_t s_live_state;   /* level_state_t 数值(1..4) */
+static uint8_t s_live_gear;    /* 0..3 */
+static bool    s_live_valid = false;
 
-void app_note_decision(const level_decision_t *ld)
+void app_note_level(uint8_t state, uint8_t gear)
 {
-    if (ld == NULL)
-    {
-        return;
-    }
-    s_last_ld       = *ld;
-    s_last_ld_valid = true;
+    s_live_state = state;
+    s_live_gear  = gear;
+    s_live_valid = true;
 }
 
 uint8_t app_live_gear(void)
 {
-    return s_last_ld_valid ? s_last_ld.gear : 0U;
+    return s_live_valid ? s_live_gear : 0U;
 }
 
 uint8_t app_live_state(void)
 {
-    return s_last_ld_valid ? (uint8_t)s_last_ld.state : 0U;
+    return s_live_valid ? s_live_state : 0U;
 }
 
 const char *app_live_state_name(void)
 {
-    if (!s_last_ld_valid) { return "Normal"; }
-    /* level_state_t 与 event_cache 的 EC_ST_* 数值完全一致(1..4), 直接复用同一份
-     * 名字映射, 免得"同一个状态两处叫法不同"。 */
-    return cloud_proto_state_name((uint8_t)s_last_ld.state);
+    if (!s_live_valid) { return "Normal"; }
+    /* level_state_t 与 event_cache 的 EC_ST_* 数值完全一致(1..4) */
+    return cloud_proto_state_name(s_live_state);
 }
 
 /** 心跳/遥测共用的"周期秒数"取值(带兜底) */

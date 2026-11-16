@@ -1,6 +1,6 @@
 /**
  * \file  lora_proto.h
- * \brief LoRa 自定义二进制帧协议（网关 ↔ 液位传感器 / 声光报警器）
+ * \brief LoRa 自定义二进制帧协议（网关 ↔ 液位传感器）
  *
  * 协议规格：帧头 AA 55 | 小端字节序 | Modbus CRC16（0xA001, 0xFFFF）
  * CRC 覆盖范围: 从协议版本字节开始算到 data 末尾（不含帧头 AA 55 和末尾 CRC 两字节）
@@ -28,8 +28,8 @@
  *
  * UID 编码规则（13 字节 / 26 位 hex，2026-10-18 起全设备统一）:
  *   [0] = (设备类型 << 4) | 环境ID
- *         设备类型: 0x1 网关 / 0x2 液位传感器 / 0x3 声光报警器
- *         环境 1 时为 0x11(网关) / 0x21(液位) / 0x31(声光)
+ *         设备类型: 0x1 网关 / 0x2 液位传感器
+ *         环境 1 时为 0x11(网关) / 0x21(液位)
  *   [1..12] = 芯片 96 位 UID，原样搬运（不是 BCD、不是十进制编号）
  *   hex 串固定 26 位（13 字节 × 2），比较时大小写不敏感。
  *   ⚠️ 3 字节地址（"110001" / "210001" 这类 6 字符串）已于 2026-10-18 全面废弃，
@@ -128,11 +128,8 @@ bool     LoraApp_WaitTxDone(uint32_t timeout_ms);
 #define LORA_FRAME_OVERHEAD     33U     /* 2 头 + 1 版本 + 13 gw + 13 dev + 1 func + 1 dlen + 2 CRC */
 /* 无载荷时的最小帧长(即 31 + 0 + 2), 用于解析前的最低长度检查 */
 #define LORA_FRAME_HDR_SIZE     LORA_FRAME_OVERHEAD
-/* 载荷长度上限（声光报警器带 LED+TTS 的 UTF-8 文本，一个汉字 3 字节）
- * 2026-10-18: 240 -> 207（总帧长保持 240: 240 - 33 = 207）
- * ⚠️ 2026-10-28 更正: 这里原来写的是"GB2312 文本"，与实现不符 ——
- *    level_gear_build_payload() 用 utf8_char_len 逐字判定、原样搬运 UTF-8，
- *    【不做 GB2312 转码】(用户 2026-10-28 确认代码正确)。设备侧也必须按 UTF-8 解。 */
+/* 载荷长度上限（总帧长保持 240: 240 - 33 = 207）。
+ * 毕设版实际只使用 0x01 的 18 字节参数帧，这里保留协议级上限不变。 */
 #define LORA_FRAME_DATA_MAX     207U
 /* 完整帧缓冲大小 */
 #define LORA_FRAME_RAW_MAX      (LORA_FRAME_OVERHEAD + LORA_FRAME_DATA_MAX)
@@ -184,7 +181,6 @@ bool     LoraApp_WaitTxDone(uint32_t timeout_ms);
 /* 设备类型（高4位） */
 #define LORA_DEV_TYPE_GATEWAY       0x01U   /* 网关 (云端/本板) */
 #define LORA_DEV_TYPE_LEVEL_SENSOR  0x02U   /* 液位传感器（超声波） */
-#define LORA_DEV_TYPE_SOUND_LIGHT   0x03U   /* 声光报警器 */
 
 /* 环境ID（低4位，当前仅 0x01 一种） */
 #define LORA_ENV_ID_DEFAULT         0x01U
@@ -222,8 +218,6 @@ typedef enum
 {
     LORA_FUNC_SET_SENSOR_PARAM   = 0x01U,   /* 云端→网关→液位传感器 设置传感器参数 */
     LORA_FUNC_SENSOR_REPORT      = 0x02U,   /* 液位传感器→网关→云端 上报液位数据 */
-    LORA_FUNC_SET_ALARM          = 0x03U,   /* 云端→网关→声光报警器 设置声光报警器 */
-    LORA_FUNC_PING_ALARM         = 0x09U,   /* 网关→声光: 在线查询(无 data, 0x80 应答) */
     LORA_FUNC_BIND_REQ           = 0x04U,   /* 设备→网关广播 绑定请求(目标地址=FFFFFF) */
     LORA_FUNC_UNBIND             = 0x05U,   /* 网关→设备 解绑通知 */
     /* ★2026-10-18 新增: 出厂字段读写(仅产线/开发者用, 与云端无关)★
@@ -240,22 +234,8 @@ typedef enum
     LORA_FUNC_GET_FIELD          = 0x07U,   /* 网关→设备 读取出厂字段(请求) */
     LORA_FUNC_FIELD_RESP         = 0x08U,   /* 设备→网关 字段应答(data = 字段) */
     LORA_FUNC_OTA                = 0x70U,   /* 云端→网关→设备 OTA 升级（格式待补充） */
-    LORA_FUNC_RESP_OK            = 0x80U,   /* 双向 正常应答("收到了", 不代表执行成功) */
-    LORA_FUNC_RESP_ERR           = 0x81U,   /* 双向 错误/重传应答 */
-    /* ★★2026-10-08 新增: 声光设备(0x03)的执行结果码★★
-     *
-     * 【为什么 0x80 不够用】
-     *   0x80 是"我收到了"(链路层应答)。声光设备收到 0x03 后会【先后回两条】:
-     *       立即       回 0x80      —— 收到了(还没执行)
-     *       约 10 秒后 回 0x82/0x83 —— 执行成功 / 执行失败
-     *   用户 2026-10-08 确认: "0x82 是正常应答所以 data 字段为空, 0x83 现在
-     *   data 字段也为空, 执行成功要上报云端设备执行成功 event"。
-     *   ⇒ 要判断"灯到底亮没亮", 必须等 0x82/0x83, 不能拿 0x80 当成功。
-     *
-     * ⚠️ 只对 pending_func == LORA_FUNC_SET_ALARM 生效; 0x01(设液位参数)等
-     *   其它功能码仍然把 0x80/0x81 当终态, 行为完全不变。 */
-    LORA_FUNC_ALARM_DONE         = 0x82U,   /* 设备→网关 声光执行成功(data 为空) */
-    LORA_FUNC_ALARM_FAIL         = 0x83U    /* 设备→网关 声光执行失败(data 为空) */
+    LORA_FUNC_RESP_OK            = 0x80U,   /* 双向 正常应答 */
+    LORA_FUNC_RESP_ERR           = 0x81U    /* 双向 错误/重传应答 */
 } lora_func_code_t;
 
 /* ==================== 通用帧结构 ==================== */

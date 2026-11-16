@@ -34,7 +34,6 @@
 #include "cloud_profile.h"
 #include "config_store.h"
 #include "last_value.h"      /* v53: sen.query/dev.query 的"最近一次上报"字段 */
-#include "level_supervisor.h"/* v54: 边缘水位评估的取数+串接层 */
 #include "event_cache.h"     /* v57: 断线事件缓存（★2026-11-11 起落在外挂 Flash） */
 #include "xflash_store.h"    /* 事件队列的容量由 EVENT 分区算出 */
 #include "sensor_offline.h"
@@ -338,9 +337,9 @@ static void test_resp_build(void)
 
 static void test_cmd_table(void)
 {
-    printf("[8] 20 条命令表(2026-10-28 移除 sys.time_sync)\n");
+    printf("[8] 12 条命令表(毕设版: 移除 sys.time_sync 及 dev.*/rule.*)\n");
 
-    CHECK(cloud_proto_cmd_count() == 20u, "命令条数 == 20 (实际 %u)",
+    CHECK(cloud_proto_cmd_count() == 12u, "命令条数 == 12 (实际 %u)",
           (unsigned)cloud_proto_cmd_count());
 
     CHECK(cloud_proto_is_known_cmd("sys.query_status"), "sys.query_status");
@@ -354,14 +353,10 @@ static void test_cmd_table(void)
     CHECK(cloud_proto_is_known_cmd("sen.unbind"), "sen.unbind");
     CHECK(cloud_proto_is_known_cmd("sen.set"), "sen.set");
     CHECK(cloud_proto_is_known_cmd("sen.query"), "sen.query");
-    CHECK(cloud_proto_is_known_cmd("dev.bind"), "dev.bind");
-    CHECK(cloud_proto_is_known_cmd("dev.unbind"), "dev.unbind");
-    CHECK(cloud_proto_is_known_cmd("dev.set"), "dev.set");
-    CHECK(cloud_proto_is_known_cmd("dev.ctrl"), "dev.ctrl");
-    CHECK(cloud_proto_is_known_cmd("dev.query"), "dev.query");
-    CHECK(cloud_proto_is_known_cmd("rule.set"), "rule.set");
-    CHECK(cloud_proto_is_known_cmd("rule.query"), "rule.query");
-    CHECK(cloud_proto_is_known_cmd("rule.mode"), "rule.mode");
+    /* 毕设版: dev.* / rule.* 已随一体机删除 */
+    CHECK(!cloud_proto_is_known_cmd("dev.bind"), "dev.bind 已删除");
+    CHECK(!cloud_proto_is_known_cmd("dev.ctrl"), "dev.ctrl 已删除");
+    CHECK(!cloud_proto_is_known_cmd("rule.set"), "rule.set 已删除");
     CHECK(cloud_proto_is_known_cmd("ota.start"), "ota.start");
     CHECK(cloud_proto_is_known_cmd("ota.query"), "ota.query");
     CHECK(cloud_proto_is_known_cmd("ota.abort"), "ota.abort");
@@ -717,17 +712,14 @@ static void test_status_data(void)
     st.current_gear   = 2u;
     st.sensors_online = 2u;
     st.sensors_total  = 2u;
-    st.devices_online = 1u;
-    st.devices_total  = 1u;
 
     n = cloud_proto_build_status_data(buf, (uint16_t)sizeof(buf), &st);
     CHECK(n > 0u, "生成成功 n=%u", (unsigned)n);
     CHECK(strcmp(buf,
                  "{\"online\":true,\"fwVersion\":\"1.0.0\",\"slot\":\"A\",\"configVersion\":7,"
                  "\"rsrp\":-85,\"uptimeSeconds\":3600,\"mode\":\"auto\","
-                 "\"currentStatus\":\"Normal\",\"currentGear\":2,\"sensorsOnline\":2,\"sensorsTotal\":2,"
-                 "\"devicesOnline\":1,\"devicesTotal\":1}") == 0,
-          "字段与文档 7.7 逐字符一致(13 个, bufferedEvents 已移除)");
+                 "\"currentStatus\":\"Normal\",\"currentGear\":2,\"sensorsOnline\":2,\"sensorsTotal\":2}") == 0,
+          "字段与文档 7.7 逐字符一致(11 个, bufferedEvents 与 devices* 已移除)");
 
     n = cloud_proto_build_uplink(up, (uint16_t)sizeof(up), "status.report", "h001",
                                  1735689600u, buf);
@@ -1123,16 +1115,14 @@ static void test_cfg_set_handler(void)
      * 2026-09-30 第 9 条改判。 */
     rc = cloud_proto_handle(
         "{\"cmd\":\"cfg.set\",\"msgId\":\"s7\",\"ts\":1,\"data\":{\"expectVersion\":4,"
-        "\"sections\":{\"network\":{\"port\":1884},\"rules\":{\"manualTimeoutSeconds\":120}}}}",
+        "\"sections\":{\"network\":{\"port\":1884}}}}",
         1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "network + rules -> OK (rc=%d)", rc);
-    /* 域名顺序按文档固定顺序(network 在 rules 之前) */
-    CHECK(strstr(s_big_resp, "\"applied\":[\"network\",\"rules\"]") != NULL,
-          "★ applied = [\"network\",\"rules\"]");
+    CHECK(rc == CLOUD_EC_OK, "只改 network -> OK (rc=%d)", rc);
+    CHECK(strstr(s_big_resp, "\"applied\":[\"network\"]") != NULL,
+          "★ applied = [\"network\"]");
     CHECK(strstr(s_big_resp, "\"rejected\":[]") != NULL, "★ network 不再被拒");
     CHECK(config_store_get()->network.port == 1884u,
           "★ network.port 真的写进去了 (实际 %u)", (unsigned)config_store_get()->network.port);
-    CHECK(config_store_get()->rules.manual_timeout_s == 120u, "rules 生效");
     CHECK(config_store_version() == 5u, "有域生效 -> 版本 +1");
 
     /* network 的改动必须【落盘】(重启后要能读到) */
@@ -1837,149 +1827,6 @@ static void test_msgid_idempotent(void)
     CHECK(cloud_proto_dedup_hit_count() == 0u,
           "★ 大应答不进缓存, 所以没有命中(靠重执行拿到同样正文)");
 }
-
-/* =================================================================
- * [22] sen.unbind / dev.unbind / rule.mode  (v34+)
- * -----------------------------------------------------------------
- * 这三条是本工程"事务式改配置"范式的第一批量产命令, 所以除了各自的语义,
- * 还要守住两条通用判据：
- *   · 失败时配置与版本【一个字都不动】;
- *   · 成功时必须【真的落盘】(用 config_store_load 从 Flash 读回来验证, 不是读内存实例)。
- * ================================================================= */
-static void test_unbind_and_rule_mode(void)
-{
-    uint16_t rl;
-    int      rc;
-
-    printf("\n[22] sen.unbind / dev.unbind / rule.mode\n");
-
-    cloud_live_reset(3u);                   /* 1 传感器 210001 + 1 设备 310001, 版本 3 */
-
-    /* 先把 1 号档位改成"只发给 310001", 好验证解绑后 targets 会被摘掉 */
-    {
-        config_store_t *m = config_store_get_mut();
-
-        m->gears[1].targets_all  = 0u;
-        m->gears[1].target_count = 1u;
-        (void)strcpy(m->gears[1].target_uid[0], "31000000000000000000000001");
-        CHECK(config_store_save(m) == CFG_OK, "准备: 档位1 只指向 310001 并落盘");
-    }
-
-    /* ---------- rule.mode: manual + 本次覆盖 manualTimeoutSeconds ---------- */
-    rc = cloud_proto_handle("{\"cmd\":\"rule.mode\",\"msgId\":\"rm1\",\"ts\":1000,"
-                            "\"data\":{\"mode\":\"manual\",\"manualTimeoutSeconds\":120}}",
-                            1000u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "rule.mode -> manual 成功 (rc=%d)", rc);
-    CHECK(strstr(s_big_resp, "\"configVersion\":4") != NULL,
-          "应答带上了新的 configVersion=4");
-    CHECK(config_store_get()->rules.mode == (uint8_t)CFG_RULE_MANUAL, "内存里 mode=manual");
-    CHECK(config_store_get()->rules.manual_timeout_s == 120u,
-          "manualTimeoutSeconds 被本次覆盖成 120");
-
-    {
-        config_store_t chk;
-        CHECK(config_store_load(&chk) == CFG_OK, "从 Flash 重新载入");
-        CHECK((chk.rules.mode == (uint8_t)CFG_RULE_MANUAL) &&
-              (chk.rules.manual_timeout_s == 120u),
-              "★ 真的落盘了(重启后仍是 manual/120)");
-    }
-
-    rc = cloud_proto_handle("{\"cmd\":\"rule.mode\",\"msgId\":\"rm2\",\"ts\":1,"
-                            "\"data\":{\"mode\":\"whenever\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "非法 mode -> 1001 (rc=%d)", rc);
-    CHECK(config_store_version() == 4u, "★ 失败时版本不动");
-
-    rc = cloud_proto_handle("{\"cmd\":\"rule.mode\",\"msgId\":\"rm3\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "缺 data/mode -> 1001");
-
-    rc = cloud_proto_handle("{\"cmd\":\"rule.mode\",\"msgId\":\"rm4\",\"ts\":1,"
-                            "\"data\":{\"mode\":\"auto\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK((rc == CLOUD_EC_OK) && (config_store_get()->rules.mode == (uint8_t)CFG_RULE_AUTO),
-          "切回 auto 成功, 且没带 manualTimeoutSeconds 时不动它 (仍 %u)",
-          (unsigned)config_store_get()->rules.manual_timeout_s);
-
-    /* ---------- sen.unbind ----------
-     * ★ P5(2026-09-29)起改为【异步】★
-     *   cloud_proto 只负责"发起": 调 lora_business_unbind() 后立即回 code 0;
-     *   真正的删除(运行期表 + config_store + gears 清理 + event.device{unbound})
-     *   由 lora_business 在【收到设备 0x80 ACK】或【重试耗尽】时完成。
-     * 所以这里分段验:
-     *   ① 命令确实把 uid 交给了业务层(替身记录了调用);
-     *   ② 业务层返回码 -1/-2/-3 被正确映射成 1001/1003/1006;
-     *   ③ 业务层"完成删除"那一步的效果(替身模拟 _unbind_finalize 调 config_store)
-     *      仍然正确 + 落盘 —— 这验的是 config_store_unbind_device 这段真实代码。 */
-    fake_lora_business_reset();
-    fake_unbind_result = 0;
-    fake_unbind_simulate_finalize = 0;      /* 先只验"发起", 不动配置 */
-
-    rc = cloud_proto_handle("{\"cmd\":\"sen.unbind\",\"msgId\":\"ub1\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"21000000000000000000000001\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "sen.unbind 210001 -> 异步受理成功 (rc=%d)", rc);
-    CHECK((fake_unbind_calls == 1) && (strcmp(fake_unbind_last_uid, "21000000000000000000000001") == 0),
-          "★ uid 被交给业务层发起解绑 (calls=%d uid=%s)",
-          fake_unbind_calls, fake_unbind_last_uid);
-    CHECK(config_store_get()->sensor_count == 1u,
-          "★ 异步: 此刻 config_store 【还没】被删(等 ACK 才删, 由业务层做)");
-    CHECK(strstr(s_big_resp, "\"data\":{}") != NULL, "文档这条响应没有 data 字段");
-
-    /* 业务层报"已有解绑在跑" -> 1006; 报"不在从机表" -> 1003; 报"uid 非法" -> 1001 */
-    fake_unbind_result = -3;
-    rc = cloud_proto_handle("{\"cmd\":\"sen.unbind\",\"msgId\":\"ub2\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"21000000000000000000000001\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_STATE, "★ 业务层返回 -3(已有解绑在跑) -> 1006 (rc=%d)", rc);
-
-    fake_unbind_result = -2;
-    rc = cloud_proto_handle("{\"cmd\":\"sen.unbind\",\"msgId\":\"ub3\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"21000000000000000000000001\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_NO_DEVICE, "★ 业务层返回 -2(不在从机表) -> 1003 (rc=%d)", rc);
-
-    fake_unbind_result = -1;
-    rc = cloud_proto_handle("{\"cmd\":\"sen.unbind\",\"msgId\":\"ub4\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"21000000000000000000000001\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ 业务层返回 -1(uid 非法) -> 1001 (rc=%d)", rc);
-
-    /* uid 格式不合法: cloud_proto 自己就该拦住, 不该去打扰业务层 */
-    {
-        int calls_before = fake_unbind_calls;
-
-        rc = cloud_proto_handle("{\"cmd\":\"sen.unbind\",\"msgId\":\"ub5\",\"ts\":1,"
-                                "\"data\":{\"uid\":\"12\"}}",
-                                1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-        CHECK(rc == CLOUD_EC_PARAM, "非法 uid(长度不对) -> 1001 (rc=%d)", rc);
-        CHECK(fake_unbind_calls == calls_before, "★ 非法 uid 根本没到业务层(前置校验拦住)");
-    }
-
-    /* ---- dev.unbind + 业务层完成删除后的效果(档位 targets 被摘掉且落盘) ---- */
-    fake_unbind_result = 0;
-    fake_unbind_simulate_finalize = 1;      /* 让替身模拟 _unbind_finalize 的收尾 */
-    fake_unbind_calls = 0;
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.unbind\",\"msgId\":\"ub6\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.unbind 310001 -> 异步受理成功 (rc=%d)", rc);
-    CHECK((fake_unbind_calls == 1) && (strcmp(fake_unbind_last_uid, "31000000000000000000000001") == 0),
-          "★ uid 交给了业务层 (calls=%d uid=%s)", fake_unbind_calls, fake_unbind_last_uid);
-    CHECK(config_store_get()->device_count == 0u, "业务层完成删除后 devices[] 已清空");
-    CHECK((config_store_get()->gears[1].targets_all == 0u) &&
-          (config_store_get()->gears[1].target_count == 0u),
-          "★ 档位1 的 targets 里那条 uid 也被摘掉了");
-
-    {
-        config_store_t chk;
-        CHECK(config_store_load(&chk) == CFG_OK, "重新载入");
-        CHECK((chk.device_count == 0u) && (chk.gears[1].target_count == 0u),
-              "★ targets 的清理【也落盘了】(不是只改了 RAM)");
-    }
-}
-
 /* =================================================================
  * [23] sen.set / dev.set  (v36)
  * -----------------------------------------------------------------
@@ -1992,7 +1839,7 @@ static void test_set_entry(void)
     uint16_t rl;
     int      rc;
 
-    printf("\n[23] sen.set / dev.set\n");
+    printf("\n[23] sen.set\n");
 
     cloud_live_reset(3u);                   /* 210001: name=东入口 period=60 offline=90; 310001: vol=50 */
 
@@ -2117,25 +1964,6 @@ static void test_set_entry(void)
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
     CHECK(rc == CLOUD_EC_PARAM, "★ 超长 name(40 字节 > 32) -> 1001, 不静默截断 (rc=%d)", rc);
 
-    /* ---------- dev.set ---------- */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.set\",\"msgId\":\"ds1\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\",\"volume\":80,\"name\":\"东门一体机\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.set volume+name -> 成功 (rc=%d)", rc);
-    CHECK((config_store_get()->devices[0].volume == 80u) &&
-          (config_store_get()->devices[0].flash_mode == 1u),
-          "★ volume 改了, 没给的 flashMode 仍是 1");
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.set\",\"msgId\":\"ds2\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\",\"type\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ type 是只读字段 -> 1001 (rc=%d)", rc);
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.set\",\"msgId\":\"ds3\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000009\",\"volume\":10}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_NO_DEVICE, "没绑过的设备 uid -> 1003 (rc=%d)", rc);
-
     /* =================================================================
      * ★2026-10-05: sen.set 改上报周期 -> 网关负责组 LoRa 0x01 帧下发设备 ★
      * -----------------------------------------------------------------
@@ -2253,82 +2081,6 @@ static void test_set_entry(void)
               fake_sensor_param_calls);
     }
 }
-
-/* =================================================================
- * [24] rule.query  (v37)
- * -----------------------------------------------------------------
- * 形状判据(文档 5.5 第 17 条): data 里【只能有】gears + rules, 其余 7 个域一个都不能漏出去。
- * 实现是"写全部 9 个域再删掉 7 个", 所以这里必须把"删干净了"逐条验一遍 ——
- * 少删一个域, 平台就会看到它不该看到的配置。
- * ================================================================= */
-static void test_rule_query(void)
-{
-    uint16_t rl;
-    int      rc;
-
-    printf("\n[24] rule.query\n");
-
-    cloud_live_reset(3u);
-
-    /* ⚠ 注意: cloud_live_reset() 只在【本进程第一次】调用时真正回到出厂默认(惰性加载),
-     * 之后它只覆盖自己显式设置的那几个字段 —— 所以这里必须把要断言的值【显式】设一遍,
-     * 不能假想法厂默认。 (这条踩过一次: manualTimeoutSeconds 断言 300 却取到 120,
-     * 因为那是上一个用例留下的值。产品行为是对的, 是测试的假设错了。) */
-    {
-        config_store_t *m = config_store_get_mut();
-
-        m->rules.mode                  = (uint8_t)CFG_RULE_MANUAL;
-        m->rules.manual_timeout_s      = 300u;
-        m->rules.sensor_offline_policy = (uint8_t)CFG_OFFLINE_KEEP;
-        CHECK(config_store_save(m) == CFG_OK, "准备: 显式设定 rules 的三个字段");
-    }
-
-    rc = cloud_proto_handle("{\"cmd\":\"rule.query\",\"msgId\":\"rq1\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "rule.query -> 成功 (rc=%d)", rc);
-
-    /* 该有的 */
-    CHECK(strstr(s_big_resp, "\"gears\":[") != NULL, "有 gears 数组");
-    CHECK(strstr(s_big_resp, "\"rules\":{") != NULL, "有 rules 对象");
-    CHECK(cj_count(s_big_resp, "data.gears") == 4u,
-          "gears 是 4 个档位(实际 %u)", (unsigned)cj_count(s_big_resp, "data.gears"));
-
-    {
-        char b[24];
-
-        (void)cj_get_str(s_big_resp, "data.rules.mode", b, (uint16_t)sizeof(b));
-        CHECK(strcmp(b, "manual") == 0, "rules.mode = manual (实际 %s)", b);
-        CHECK(cj_get_uint(s_big_resp, "data.rules.manualTimeoutSeconds", 0xDEADu) == 300u,
-              "rules.manualTimeoutSeconds = 300 (实际取到 %u)",
-              (unsigned)cj_get_uint(s_big_resp, "data.rules.manualTimeoutSeconds", 0xDEADu));
-        (void)cj_get_str(s_big_resp, "data.rules.sensorOfflinePolicy", b, (uint16_t)sizeof(b));
-        CHECK(strcmp(b, "keep") == 0, "rules.sensorOfflinePolicy = keep");
-
-        b[0] = '\0';
-        (void)cj_get_str(s_big_resp, "data.gears[0].ledColor", b, (uint16_t)sizeof(b));
-        /* ★2026-10-08: ledColor 变成"两个半屏"的逗号分隔字符串★ */
-        CHECK(strcmp(b, "off,off") == 0, "档位0 带 ledColor 且两个半屏都是 off (实际 %s)", b);
-    }
-
-    /* ★ 不该有的: 7 个域必须一个都不在 */
-    CHECK(strstr(s_big_resp, "\"system\"") == NULL, "★ 没有 system");
-    CHECK(strstr(s_big_resp, "\"network\"") == NULL, "★ 没有 network");
-    CHECK(strstr(s_big_resp, "\"sensors\"") == NULL, "★ 没有 sensors");
-    CHECK(strstr(s_big_resp, "\"devices\"") == NULL, "★ 没有 devices");
-    CHECK(strstr(s_big_resp, "\"thresholds\"") == NULL, "★ 没有 thresholds");
-    CHECK(strstr(s_big_resp, "\"ota\"") == NULL, "★ 没有 ota");
-    CHECK(strstr(s_big_resp, "\"meta\"") == NULL, "★ 没有 meta(含 crc32, 平台这是只读的)");
-
-    /* 顺序也要对: gears 在 rules 之前 */
-    CHECK(strstr(s_big_resp, "\"gears\"") < strstr(s_big_resp, "\"rules\""),
-          "键序: gears 在 rules 之前");
-
-    /* 带参数也不该出错(这条文档没有参数) */
-    rc = cloud_proto_handle("{\"cmd\":\"rule.query\",\"msgId\":\"rq2\",\"ts\":1,\"data\":{\"x\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "带无关参数不报错 (rc=%d)", rc);
-}
-
 /* =================================================================
  * [25] sys.reboot  (v38)
  * -----------------------------------------------------------------
@@ -2411,8 +2163,6 @@ static void fake_status_provider(cloud_status_t *out)
     out->current_gear   = 3u;
     out->sensors_online = 2u;
     out->sensors_total  = 5u;
-    out->devices_online = 1u;
-    out->devices_total  = 1u;
 }
 
 static void test_sys_query_status(void)
@@ -2446,8 +2196,6 @@ static void test_sys_query_status(void)
         CHECK(cj_get_uint(s_big_resp, "data.currentGear", 0u) == 3u, "currentGear = 3");
         CHECK(cj_get_uint(s_big_resp, "data.sensorsOnline", 0u) == 2u, "sensorsOnline = 2");
         CHECK(cj_get_uint(s_big_resp, "data.sensorsTotal", 0u) == 5u, "sensorsTotal = 5");
-        CHECK(cj_get_uint(s_big_resp, "data.devicesOnline", 0u) == 1u, "devicesOnline = 1");
-        CHECK(cj_get_uint(s_big_resp, "data.devicesTotal", 0u) == 1u, "devicesTotal = 1");
         (void)cj_get_str(s_big_resp, "data.fwVersion", b, (uint16_t)sizeof(b));
         CHECK(strcmp(b, "9.9.9") == 0, "fwVersion = 9.9.9 (实际 %s)", b);
         (void)cj_get_str(s_big_resp, "data.mode", b, (uint16_t)sizeof(b));
@@ -2598,178 +2346,7 @@ static void test_event_data(void)
     CHECK(cloud_proto_build_status_change_data(buf, 8u, &sc) == 0u, "sc 缓冲过小 -> 0");
     CHECK(cloud_proto_build_device_event_data(NULL, 64u, &de) == 0u, "de out=NULL -> 0");
     CHECK(cloud_proto_build_device_event_data(buf, 8u, &de) == 0u, "de 缓冲过小 -> 0");
-}
-
-/* =================================================================
- * [29] event.action + event.buffered 数据段  (v44)
- * ================================================================= */
-static void test_action_and_buffered(void)
-{
-    cloud_action_result_t   r[2];
-    cloud_action_event_t    ae;
-    cloud_buffered_event_t  be;
-    const char             *ev[2];
-    char                    buf[CFG_JSON_MAX];
-    uint16_t                n;
-
-    printf("\n[29] event.action / event.buffered 数据段\n");
-
-    (void)memset(r, 0, sizeof(r));
-    r[0].uid  = "31000000000000000000000001";
-    r[0].code = 0;
-    r[1].uid  = "31000000000000000000000002";
-    r[1].code = 1005;                       /* 个别设备 LoRa 超时 */
-
-    (void)memset(&ae, 0, sizeof(ae));
-    ae.gear         = 2u;
-    ae.trigger      = "auto";
-    ae.result_count = 1u;
-    ae.results      = r;
-
-    n = cloud_proto_build_action_data(buf, (uint16_t)sizeof(buf), &ae);
-    CHECK(n > 0u, "action 生成成功 n=%u", (unsigned)n);
-    CHECK(strcmp(buf, "{\"gear\":2,\"trigger\":\"auto\",\"results\":[{\"uid\":\"31000000000000000000000001\",\"code\":0}]}") == 0,
-          "★ 与文档 7.3 形状逐字符一致(addr->uid) (实际 %s)", buf);
-
-
-    ae.gear_null    = true;
-    ae.gear         = 0u;
-    ae.result_count = 0u;
-    ae.results      = NULL;
-    ae.trigger      = "failsafe";
-    n = cloud_proto_build_action_data(buf, (uint16_t)sizeof(buf), &ae);
-    CHECK((n > 0u) && (strstr(buf, "\"gear\":null") != NULL) &&
-          (strstr(buf, "\"trigger\":\"failsafe\"") != NULL),
-          "★ off fail-safe: event.action gear=null, trigger=failsafe");
-    ae.gear_null    = false;
-    ae.gear         = 2u;
-    ae.result_count = 2u;
-    ae.results      = r;
-    ae.result_count = 2u;
-    ae.trigger      = "failsafe";
-    n = cloud_proto_build_action_data(buf, (uint16_t)sizeof(buf), &ae);
-    CHECK((n > 0u) && (strstr(buf, "\"code\":1005") != NULL) &&
-          (strstr(buf, "\"trigger\":\"failsafe\"") != NULL),
-          "两台设备(含一台失败 1005) 与 failsafe 触发都能表达");
-
-    /* ---- event.buffered: 内嵌【原始事件对象】, 保留各自的 ts ---- */
-    ev[0] = "{\"event\":\"event.status_change\",\"msgId\":\"s099\",\"ts\":1735690000,"
-            "\"data\":{\"from\":\"Warning\",\"to\":\"Alarm\",\"gear\":3,\"levelCm\":10.5}}";
-    ev[1] = "{\"event\":\"event.action\",\"msgId\":\"a099\",\"ts\":1735690001,"
-            "\"data\":{\"gear\":3,\"trigger\":\"auto\",\"results\":[{\"uid\":\"31000000000000000000000001\",\"code\":0}]}}";
-
-    (void)memset(&be, 0, sizeof(be));
-    be.count       = 2u;
-    be.events_json = ev;
-
-    n = cloud_proto_build_buffered_data(buf, (uint16_t)sizeof(buf), &be);
-    CHECK(n > 0u, "buffered 生成成功 n=%u", (unsigned)n);
-    CHECK(strncmp(buf, "{\"events\":[", 11) == 0, "外壳是 {\"events\":[ … ]}");
-    CHECK(strstr(buf, ev[0]) != NULL, "★ 第 1 条事件【原样内嵌】(逐字节)");
-    CHECK(strstr(buf, ev[1]) != NULL, "★ 第 2 条事件【原样内嵌】(逐字节)");
-    CHECK(strstr(buf, "\"ts\":1735690000") != NULL,
-          "★ 保留事件【原始 ts】(补报不改成重连时刻)");
-    CHECK(strstr(buf, "},{\"event\"") != NULL, "两条之间是逗号分隔的完整对象");
-
-    /* ---- 分页: 超过 50 条必须明确失败, 不静默截断 ---- */
-    be.count = CLOUD_BUFFERED_MAX + 1u;
-    CHECK(cloud_proto_build_buffered_data(buf, (uint16_t)sizeof(buf), &be) == 0u,
-          "★ count = 51 > 50 -> 返回 0, 让调用方分页(不静默丢事件)");
-    be.count = 0u;
-    CHECK(cloud_proto_build_buffered_data(buf, (uint16_t)sizeof(buf), &be) == 0u,
-          "count = 0 -> 0");
-
-    /* 参数保护 */
-    be.count       = 2u;
-    be.events_json = NULL;
-    CHECK(cloud_proto_build_buffered_data(buf, (uint16_t)sizeof(buf), &be) == 0u,
-          "events_json=NULL -> 0");
-    ae.result_count = 2u;
-    ae.results      = NULL;
-    CHECK(cloud_proto_build_action_data(buf, (uint16_t)sizeof(buf), &ae) == 0u,
-          "action: count>0 但 results=NULL -> 0(不解引用)");
-    CHECK(cloud_proto_build_action_data(NULL, 64u, &ae) == 0u, "action out=NULL -> 0");
-}
-
-/* =================================================================
- * [30] rule.set  (v47)
- * -----------------------------------------------------------------
- * 两条判据:
- *   1) 按 gear 合并: 给一个 {gear:2,...} 只改 2 号档, 别的档位与"未提及的字段"都不能动;
- *   2) ★ 只允许改 gears ★: data 里夹带别的域要【明确拒绝】, 不能"只挑 gears 生效、
- *      其余静默忽略"(那会让平台以为配置改成功了)。
- * ================================================================= */
-static void test_rule_set(void)
-{
-    uint16_t rl;
-    int      rc;
-
-    printf("\n[30] rule.set (按 gear 合并 / 只允许改 gears)\n");
-
-    cloud_live_reset(3u);                   /* 版本 3, 出厂 gears(0~3, targets=all) */
-
-    /* ---- 正常: 只改 2 号档的 flashMode 与文本 ---- */
-    rc = cloud_proto_handle(
-        "{\"cmd\":\"rule.set\",\"msgId\":\"rs1\",\"ts\":1000,\"data\":{\"gears\":["
-        "{\"gear\":2,\"flashMode\":2,\"ledTextTemplate1\":\"改过的{level}CM\"}]}}",
-        1000u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "rule.set 只改 2 号档 -> 成功 (rc=%d)", rc);
-    CHECK(strstr(s_big_resp, "\"configVersion\":4") != NULL,
-          "应答带上了新 configVersion=4");
-    CHECK(config_store_get()->gears[2].sound_mode == 2u, "2 号档 flashMode 改了");
-    CHECK(strcmp(config_store_get()->gears[2].led_text1, "改过的{level}CM") == 0,
-          "2 号档文本1改了");
-    CHECK(config_store_get()->gears[2].gear == 2u, "★ 槽位不变量 gear==2 仍成立");
-    CHECK(config_store_get()->gears[0].sound_mode == 0u,
-          "★ 0 号档没被动(flashMode 仍是 0)");
-    CHECK(strcmp(config_store_get()->gears[1].led_text1,
-                 "路面积水{level}CM") == 0,
-          "★ 1 号档的文本保持原值(未提及的档位不动)");
-
-    {
-        config_store_t chk;
-        CHECK(config_store_load(&chk) == CFG_OK, "从 Flash 重新载入");
-        CHECK((chk.gears[2].sound_mode == 2u) &&
-              (strcmp(chk.gears[2].led_text1, "改过的{level}CM") == 0),
-              "★ 落盘了");
-    }
-
-    /* ---- 只允许改 gears: 夹带别的域 -> 1001, 且配置不动 ---- */
-    rc = cloud_proto_handle(
-        "{\"cmd\":\"rule.set\",\"msgId\":\"rs2\",\"ts\":1,\"data\":{\"gears\":["
-        "{\"gear\":1,\"flashMode\":1}],\"thresholds\":{\"alarmCm\":50}}}",
-        1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ 夹带 thresholds -> 1001 (rc=%d)", rc);
-    CHECK(config_store_get()->gears[1].sound_mode == 1u,
-          "★ 被拒时连 gears 也不生效(不存在半条命令生效)");
-    CHECK(config_store_version() == 4u, "★ 被拒时版本不动");
-
-    /* ---- 必须带 gears ---- */
-    rc = cloud_proto_handle("{\"cmd\":\"rule.set\",\"msgId\":\"rs3\",\"ts\":1,"
-                            "\"data\":{\"thresholds\":{\"alarmCm\":50}}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "没带 gears -> 1001 (rc=%d)", rc);
-
-    /* ---- 缺 gear 字段 -> 校验拒 -> 1001 ---- */
-    rc = cloud_proto_handle("{\"cmd\":\"rule.set\",\"msgId\":\"rs4\",\"ts\":1,"
-                            "\"data\":{\"gears\":[{\"flashMode\":1}]}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ 缺 gear 字段 -> 1001 (rc=%d)", rc);
-
-    /* ---- 非法值(flashMode=9) -> 校验整域拒 -> 1001 ---- */
-    rc = cloud_proto_handle("{\"cmd\":\"rule.set\",\"msgId\":\"rs5\",\"ts\":1,"
-                            "\"data\":{\"gears\":[{\"gear\":3,\"flashMode\":9}]}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ 非法 flashMode -> 1001 (rc=%d)", rc);
-    CHECK(config_store_get()->gears[3].sound_mode == 3u,
-          "★ 被拒后 3 号档未被改坏(仍是出厂默认 3 = 快闪)");
-
-    rc = cloud_proto_handle("{\"cmd\":\"rule.set\",\"msgId\":\"rs6\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "连 data 都没有 -> 1001");
-}
-
-/* =================================================================
+}/* =================================================================
  * [31] sys.time_sync —— 已废弃(2026-10-28 从分发表移除)
  * -----------------------------------------------------------------
  * 用户 2026-10-28 裁决: 该命令废弃, 平台不再使用, 网关同步从分发表移除。
@@ -2804,12 +2381,10 @@ static uint32_t     s_pair_calls;
 static char         s_pair_serial[24];
 static char         s_pair_name[40];
 static uint16_t     s_pair_window;
-static bool         s_pair_is_sensor;
-static uint8_t      s_pair_dev_type;     /* ★ 第 11 条: dev.bind 的 type 有没有传到底 */
 static bool         s_pair_result;
 
 static bool fake_pair_open(const char *serial, const char *name,
-                           uint16_t window_s, bool is_sensor, uint8_t dev_type)
+                           uint16_t window_s)
 {
     s_pair_calls++;
     (void)strncpy(s_pair_serial, (serial != NULL) ? serial : "", sizeof(s_pair_serial) - 1u);
@@ -2817,8 +2392,6 @@ static bool fake_pair_open(const char *serial, const char *name,
     (void)strncpy(s_pair_name, (name != NULL) ? name : "", sizeof(s_pair_name) - 1u);
     s_pair_name[sizeof(s_pair_name) - 1u] = '\0';
     s_pair_window    = window_s;
-    s_pair_is_sensor = is_sensor;
-    s_pair_dev_type  = dev_type;
     return s_pair_result;
 }
 
@@ -2827,7 +2400,7 @@ static void test_bind(void)
     uint16_t rl;
     int      rc;
 
-    printf("\n[32] sen.bind / dev.bind (配对窗口 + 后端钩子)\n");
+    printf("\n[32] sen.bind (配对窗口 + 后端钩子)\n");
 
     cloud_live_reset(3u);               /* 1 传感器 + 1 设备, 版本 3 */
 
@@ -2852,52 +2425,16 @@ static void test_bind(void)
     CHECK(strstr(s_big_resp, "\"pairWindowSeconds\":60") != NULL,
           "★ 默认窗口 60s 写进应答 (文档 5.3)");
     CHECK((s_pair_calls == 1u) && (strcmp(s_pair_serial, "WL20260001") == 0) &&
-          (strcmp(s_pair_name, "西入口") == 0) && s_pair_is_sensor,
-          "★ 后端拿到了 serial/name 且知道这是传感器");
+          (strcmp(s_pair_name, "西入口") == 0),
+          "★ 后端拿到了 serial/name");
 
-    /* ★ 第 11 条: dev.bind 必须带 type, 且【只认 1 声光 / 3 一体机】
-     *   ★2026-10-28(A5): 以前判的是 1~3 闭区间, 于是 type=2(纯 LED) 也能绑进来;
-     *   文档 3.6 与协议 §5.4 明确"type=2 暂无 uid 编号空间, 暂不支持绑定"。 */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b3\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260001\",\"pairWindowSeconds\":120,"
-                            "\"type\":3}}",
+    /* 窗口秒数可覆盖(sen.bind 也支持 pairWindowSeconds) */
+    rc = cloud_proto_handle("{\"cmd\":\"sen.bind\",\"msgId\":\"b3\",\"ts\":1,"
+                            "\"data\":{\"serial\":\"WL20260001\",\"pairWindowSeconds\":120}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK((rc == CLOUD_EC_OK) && (s_pair_window == 120u) && (!s_pair_is_sensor),
-          "★ dev.bind 的窗口秒数可覆盖, 且 is_sensor=false");
-    CHECK(s_pair_dev_type == 3u,
-          "★ type=3(一体机) 一路传到配对后端, 不再被丢掉 (实际 %u)", (unsigned)s_pair_dev_type);
+    CHECK((rc == CLOUD_EC_OK) && (s_pair_window == 120u),
+          "★ sen.bind 的窗口秒数可覆盖 (rc=%d)", rc);
     CHECK(strstr(s_big_resp, "\"pairWindowSeconds\":120") != NULL, "应答回的是 120");
-
-    /* type=2 纯 LED: 文档明确暂不支持 -> 1001 */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b3led\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260003\",\"type\":2}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ dev.bind type=2(纯LED, 暂不支持) -> 1001 (rc=%d)", rc);
-
-    /* type 必填: 缺了 / 越界一律 1001(不猜 —— devices[].type 文档标只读, 写错只能解绑重绑) */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b3a\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260002\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ dev.bind 缺 type -> 1001 (rc=%d)", rc);
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b3b\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260002\",\"type\":9}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ dev.bind type=9(越界) -> 1001 (rc=%d)", rc);
-
-    /* ★2026-11-03 统一口径: type=1 现在表示【液位】—— dev.bind 带 1 要开液位窗口 */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b3lv\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"WL20260009\",\"type\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK((rc == CLOUD_EC_OK) && s_pair_is_sensor,
-          "★ dev.bind type=1 = 液位 -> 开液位窗口 (rc=%d, is_sensor=%d)",
-          rc, (int)s_pair_is_sensor);
-
-    /* sen.bind 不带 type 也必须照常成功(type 只对联动设备有意义) */
-    rc = cloud_proto_handle("{\"cmd\":\"sen.bind\",\"msgId\":\"b3c\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"WL20260009\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "★ sen.bind 不需要 type (rc=%d)", rc);
 
     /* ---- 3) 参数校验 ----
      * ★2026-10-08: serial 已改为【可选】★ 用户口径"这一个字段直接丢":
@@ -2939,13 +2476,8 @@ static void test_bind(void)
         config_store_t *m = config_store_get_mut();
         uint8_t         i;
 
-        /* ★ 用户口径是【总数≤5, 液位≤4, 声光≤3】—— 所以这里要造的是
-         *   "液位到顶(4), 但总数还没到 5, 设备仍有位置":
-         *     · cloud_live_reset() 自带 1 传感器 + 1 设备, 得先把设备槽清掉,
-         *       否则 4+1=5 直接顶满"总≤5", can_add() 对【任何】类型都返回 false
-         *       —— 下面那句"dev.bind 仍可开窗"就永远进不去(实测 rc=1009);
-         *     · 只填 4 台液位(而不是 CFG_SENSOR_MAX=5): 5 台本身就违反"液位≤4"。 */
-        m->device_count = 0u;
+        /* ★ 用户口径是液位≤4 —— 这里造"液位到顶(4)"的场景, 验证 sen.bind 会回 1009。
+         *   只填 4 台液位(而不是 CFG_SENSOR_MAX=5): 5 台本身就违反"液位≤4"。 */
         m->sensor_count = 4u;                           /* 液位装满 4(≤4) */
         for (i = 0u; i < 4u; i++)
         {
@@ -2957,9 +2489,8 @@ static void test_bind(void)
             m->sensors[i].offline_timeout_s = 90u;
             m->sensors[i].enabled           = 1u;
         }
-        CHECK(config_store_save(m) == CFG_OK, "准备: 液位填到上限 4 台(总数 4, 设备还有位置)");
+        CHECK(config_store_save(m) == CFG_OK, "准备: 液位填到上限 4 台");
         CHECK(!config_store_can_add(true),  "液位已满 -> 不能再加液位");
-        CHECK(config_store_can_add(false),  "★ 设备还没满(总数 4<5, 设备 0<3) -> 还能加设备");
     }
     /* 计数归零: 后面的断言要的是"这一条【没有】去开窗", 与前面开过几次无关 */
     s_pair_calls = 0u;
@@ -2969,15 +2500,13 @@ static void test_bind(void)
     CHECK(rc == CLOUD_EC_LIMIT, "★ 传感器已满 -> 1009 (rc=%d)", rc);
     CHECK(s_pair_calls == 0u, "★ 满员时【没有】去开窗(先拦住, 别等配对成功才发现放不下)");
 
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b9\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260002\",\"type\":3}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "设备还没满, dev.bind 仍可开窗 (rc=%d)", rc);
+    /* 后面几条需要能真正开窗 -> 恢复 1 传感器配置 */
+    cloud_live_reset(3u);
 
     /* ---- 5) 后端报失败 -> 1007 ---- */
     s_pair_result = false;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"b10\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260003\",\"type\":3}}",
+    rc = cloud_proto_handle("{\"cmd\":\"sen.bind\",\"msgId\":\"b10\",\"ts\":1,"
+                            "\"data\":{\"serial\":\"WL20260003\"}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
     CHECK(rc == CLOUD_EC_INTERNAL, "后端返回 false -> 1007 (rc=%d)", rc);
 
@@ -2986,15 +2515,13 @@ static void test_bind(void)
      * ⚠ msgId 必须独家: 幂等缓存会重放同 msgId 的旧应答, 撞号会掩盖真实判断
      *   (本次改注释时就踩过 —— 用 b8/b9 撞了后面的容量用例, 导致误判)。 */
     s_pair_result = true;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"bw300\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260004\",\"type\":3,"
-                            "\"pairWindowSeconds\":300}}",
+    rc = cloud_proto_handle("{\"cmd\":\"sen.bind\",\"msgId\":\"bw300\",\"ts\":1,"
+                            "\"data\":{\"serial\":\"WL20260004\",\"pairWindowSeconds\":300}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
     CHECK(rc == CLOUD_EC_OK, "pairWindowSeconds=300(边界) -> 收 (rc=%d)", rc);
 
-    rc = cloud_proto_handle("{\"cmd\":\"dev.bind\",\"msgId\":\"bw301\",\"ts\":1,"
-                            "\"data\":{\"serial\":\"LK20260005\",\"type\":3,"
-                            "\"pairWindowSeconds\":301}}",
+    rc = cloud_proto_handle("{\"cmd\":\"sen.bind\",\"msgId\":\"bw301\",\"ts\":1,"
+                            "\"data\":{\"serial\":\"WL20260005\",\"pairWindowSeconds\":301}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
     CHECK(rc == CLOUD_EC_PARAM, "★ pairWindowSeconds=301 -> 1001(上限 300) (rc=%d)", rc);
 
@@ -3026,11 +2553,9 @@ static void test_sen_dev_query(void)
     uint16_t rl;
     int      rc;
     uint8_t  suid[13];
-    uint8_t  duid[13];
     char     s_uid[27];
-    char     d_uid[27];
 
-    printf("\n[33] sen.query / dev.query\n");
+    printf("\n[33] sen.query\n");
 
     cloud_live_reset(3u);               /* 测试助手内置: 1 传感器 + 1 设备 */
     last_value_reset();
@@ -3044,10 +2569,7 @@ static void test_sen_dev_query(void)
           "sensors 有 1 台 (实际 %u)", (unsigned)cj_count(s_big_resp, "data.sensors"));
     CHECK(strstr(s_big_resp, "\"system\"") == NULL, "★ 没有 system");
     CHECK(strstr(s_big_resp, "\"network\"") == NULL, "★ 没有 network");
-    CHECK(strstr(s_big_resp, "\"devices\"") == NULL, "★ 没有 devices");
     CHECK(strstr(s_big_resp, "\"thresholds\"") == NULL, "★ 没有 thresholds");
-    CHECK(strstr(s_big_resp, "\"gears\"") == NULL, "★ 没有 gears");
-    CHECK(strstr(s_big_resp, "\"rules\"") == NULL, "★ 没有 rules");
     CHECK(strstr(s_big_resp, "\"meta\"") == NULL, "★ 没有 meta");
 
     s_uid[0] = '\0';
@@ -3104,303 +2626,10 @@ static void test_sen_dev_query(void)
     CHECK(strstr(s_big_resp, "\"lastTs\"") == NULL,
           "★ 时钟没注册 -> 不给 lastTs(不拿 0 冒充 1970)");
 
-    /* ---- 5) dev.query: 只带 devices 域, 且不补 levelCm ---- */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.query\",\"msgId\":\"dq1\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.query -> 成功 (rc=%d)", rc);
-    CHECK(cj_count(s_big_resp, "data.devices") == 1u, "devices 有 1 台");
-    CHECK(strstr(s_big_resp, "\"sensors\"") == NULL, "★ 没有 sensors");
-    CHECK(strstr(s_big_resp, "\"system\"") == NULL, "★ 没有 system");
-    CHECK(strstr(s_big_resp, "\"meta\"") == NULL, "★ 没有 meta");
-    CHECK(strstr(s_big_resp, "lastLevelCm") == NULL, "★ 联动设备没有水位 -> 不补 lastLevelCm");
-
-    d_uid[0] = '\0';
-    (void)cj_get_str(s_big_resp, "data.devices[0].uid", d_uid, (uint16_t)sizeof(d_uid));
-    if (cfg_uid_to_bytes(d_uid, duid))
-    {
-        s_query_unix = 1700000999u;
-        last_value_set_now_hook(query_fake_now_unix);
-        (void)last_value_update(duid, 0u, 33u, 0u, 3000u);
-
-        rc = cloud_proto_handle("{\"cmd\":\"dev.query\",\"msgId\":\"dq2\",\"ts\":1}",
-                                1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-        CHECK(rc == CLOUD_EC_OK, "dev.query(有上报) -> 成功");
-        CHECK(strstr(s_big_resp, "\"batteryPercent\":33") != NULL, "★ 设备补 batteryPercent");
-        CHECK(strstr(s_big_resp, "\"lastTs\":1700000999") != NULL, "★ 设备补 lastTs");
-        CHECK(strstr(s_big_resp, "lastLevelCm") == NULL, "★ 设备仍不补 lastLevelCm");
-    }
-
-    /* ---- 6) ★2026-10-18: 声光报警器从不发 0x02, 永远不进 last_value 快照表 ----
-     * 以前它的 online 恒为 false —— 哪怕刚执行成功过, 平台也会一直误报掉线。
-     * 现在"没有快照"时会问 lora_business_device_state():
-     *   ONLINE  -> online:true
-     *   OFFLINE -> online:false
-     *   UNKNOWN -> online:false(维持旧行为, 不无端改成在线)
-     * 替身(cloud_proto 只依赖 lora_business_device_state 这一个符号)默认回 UNKNOWN。 */
-    last_value_reset();                 /* 清掉快照, 模拟"这台从没上报过" */
-
-    fake_device_state = LORA_DEV_STATE_ONLINE;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.query\",\"msgId\":\"dq3\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.query(声光在线) -> 成功");
-    CHECK(strstr(s_big_resp, "\"online\":true") != NULL,
-          "★ 声光: 业务层说在线 -> online:true(以前恒 false)");
-    CHECK(strstr(s_big_resp, "\"lastTs\"") == NULL, "★ 没快照仍不给 lastTs(不拿 0 冒充)");
-
-    fake_device_state = LORA_DEV_STATE_OFFLINE;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.query\",\"msgId\":\"dq4\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.query(声光离线) -> 成功");
-    CHECK(strstr(s_big_resp, "\"online\":false") != NULL,
-          "★ 声光: 业务层说离线 -> online:false");
-
-    fake_device_state = LORA_DEV_STATE_UNKNOWN;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.query\",\"msgId\":\"dq5\",\"ts\":1}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK && strstr(s_big_resp, "\"online\":false") != NULL,
-          "★ 声光: 从机表里查不到(UNKNOWN) -> online:false(与旧行为一致)");
-
     /* 收尾: 别把钩子/表留给后面的用例 */
     last_value_set_now_hook(NULL);
     last_value_reset();
-}
-
-/* =================================================================
- * [34] level_supervisor: 边缘水位评估的取数 + 串接 (v54)
- * -----------------------------------------------------------------
- * 这一层补的是 level_eval.c 一直缺的"调用方"(它此前是死代码)。
- * 重点验三件:
- *   1) ★ 没有新上报就【不推进】confirmCount ★ —— 主循环每秒调一次也不会把
- *      "连续 2 次一致"变成"立刻满足"。防抖必须按【上报】计数, 不能按轮次;
- *   2) 有效水位/档位/模板渲染真的从 配置 + 最后值 里取到了;
- *   3) dispatch 的闭环: mark_sent() 之后, 同档位同文本不再重发。
- * ================================================================= */
-static void test_level_supervisor(void)
-{
-    level_decision_t      d;
-    const config_store_t *cfg;
-    uint8_t               uid[13];
-    char                  uid_hex[27];
-
-    printf("\n[34] level_supervisor (边缘水位评估取数+串接)\n");
-
-    cloud_live_reset(3u);               /* 1 传感器 + 1 设备 */
-    last_value_reset();
-    last_value_set_now_hook(NULL);
-    level_supervisor_init();
-
-    /* ★ 用例隔离: 必须显式把 rules.mode 摆成 auto ★
-     * 本套件里 test_unbind_and_rule_mode() 早先把 rules.mode 写成了 manual, 而那是
-     * 【同一份共享配置】—— 于是本用例的 dispatch 会被"manual 抑制自动联动"
-     * (2026-09-30 第 6 条新加的行为)正确地压住, 断言全部反掉。
-     * 这不是 bug, 是用例之间没隔离: 想测自动联动, 就得先处于 auto 模式。 */
-    config_store_get_mut()->rules.mode = (uint8_t)CFG_RULE_AUTO;
-    CHECK(config_store_save(config_store_get_mut()) == CFG_OK, "准备: 强制 auto 模式");
-
-    cfg = config_store_get();
-    CHECK(cfg->sensor_count >= 1u, "准备: 配置里有传感器");
-    (void)strncpy(uid_hex, cfg->sensors[0].uid, sizeof(uid_hex) - 1u);
-    uid_hex[sizeof(uid_hex) - 1u] = '\0';
-    CHECK(cfg_uid_to_bytes(uid_hex, uid), "准备: uid 串可转 3 字节");
-
-    /* 把 confirmCount 提到 2 —— 否则"按上报计数"这件事根本验不出来 */
-    {
-        config_store_t *m = config_store_get_mut();
-
-        m->thresholds.alarm_cm             = 10u;
-        m->thresholds.warning_cm           = 7u;
-        m->thresholds.resolve_cm           = 2u;
-        m->thresholds.min_change_cm        = 1u;
-        m->thresholds.event_min_interval_s = 0u;
-        m->thresholds.confirm_count        = 2u;
-        CHECK(config_store_save(m) == CFG_OK, "准备: confirmCount=2, 阈值 10/7/2cm");
-    }
-    cfg = config_store_get();
-
-    /* ---- 1) 还没有任何上报 ---- */
-    level_supervisor_poll(cfg, 1000u, &d);
-    CHECK(d.new_sample == false, "★ 没有新上报 -> new_sample = false");
-    CHECK(d.have_level == false, "没样本时不做判定");
-
-    /* ---- 2) 第 1 条上报: 90mm = 9.0cm -> Warning 候选(7 < 9 < 10) ---- */
-    CHECK(last_value_update(uid, 90u, 80u, 0u, 1000u), "准备: 喂 90mm(=9.0cm)");
-    level_supervisor_poll(cfg, 1000u, &d);
-    CHECK(d.new_sample == true, "★ 有新上报 -> new_sample = true");
-    CHECK(d.have_level == true, "有有效水位");
-    CHECK(d.level_mm == 90, "有效水位 = 90mm (实际 %ld)", (long)d.level_mm);
-    CHECK(d.migrated == false, "★ confirmCount=2: 第 1 次还不迁移");
-    CHECK(d.event_due == true, "首次水位事件该发(level_event_should_fire 首次恒 true)");
-
-    /* ---- 3) ★ 空转: 反复 poll 但没有新上报, 必须一点都不推进 ★ ----
-     * 后面"第 2 条上报才迁移"就是这里的证明: 若空转把次数攒够了, 迁移会在
-     * 空转期间被消费掉, 第 2 条上报就不会再报 migrated=true。 */
-    {
-        uint8_t i;
-
-        for (i = 0u; i < 20u; i++)
-        {
-            level_supervisor_poll(cfg, 1000u + (uint32_t)i, &d);
-            CHECK(d.new_sample == false, "★ 空转 #%u -> 不推进", (unsigned)i);
-        }
-    }
-
-    /* ---- 4) 第 2 条上报(同样 90mm) -> 连续 2 次一致 -> 迁移 ---- */
-    CHECK(last_value_update(uid, 90u, 80u, 0u, 1200u), "准备: 再喂 90mm");
-    level_supervisor_poll(cfg, 1200u, &d);
-    CHECK(d.new_sample == true, "新上报");
-    CHECK(d.migrated == true, "★ 第 2 次一致 -> 确认迁移(空转没吃掉计数)");
-    CHECK(d.state == LEVEL_ST_WARNING, "状态 = Warning (实际 %u)", (unsigned)d.state);
-    CHECK(d.prev_state == LEVEL_ST_UNKNOWN,
-          "★ 上电后首次确认: 迁移前状态 = UNKNOWN (实际 %u)", (unsigned)d.prev_state);
-    CHECK(d.gear == 2u, "★ 档位 = 2 (实际 %u)", (unsigned)d.gear);
-    CHECK(d.led_text1[0] != '\0', "LED 文本1 已渲染: \"%s\"", d.led_text1);
-    CHECK(d.dispatch == true, "从没成功发过 -> 该下发");
-
-    /* ---- 5) 发过之后: 同档位 + 同级水位 -> 不重发 ---- */
-    level_supervisor_mark_sent(d.gear, d.led_text1, d.led_text2);
-    CHECK(last_value_update(uid, 90u, 79u, 0u, 1300u), "准备: 再来一条同级上报");
-    level_supervisor_poll(cfg, 1300u, &d);
-    CHECK(d.migrated == false, "状态没变 -> 不算迁移");
-    CHECK(d.dispatch == false, "★ 档位与渲染文本都没变 -> 不重发");
-
-    /* ---- 6) 越阈值 -> 迁移到 Alarm(档位 3) ---- */
-    CHECK(last_value_update(uid, 110u, 70u, 0u, 1400u), "准备: 110mm=11.0cm >= alarmCm(10cm)");
-    level_supervisor_poll(cfg, 1400u, &d);
-    CHECK(d.migrated == false, "confirmCount=2: 又回到第 1 次");
-    CHECK(last_value_update(uid, 110u, 70u, 0u, 1500u), "准备: 再来一条 110mm");
-    level_supervisor_poll(cfg, 1500u, &d);
-    CHECK(d.migrated == true, "连续 2 次 -> 迁移");
-    CHECK(d.gear == 3u, "★ 档位 = 3 (实际 %u)", (unsigned)d.gear);
-    CHECK(d.dispatch == true, "★ 档位变了 -> 一定重发");
-    CHECK(d.prev_state == LEVEL_ST_WARNING,
-          "★ 本次是 Warning -> Alarm, 迁移前状态必须是 Warning (实际 %u)",
-          (unsigned)d.prev_state);
-
-    /* ---- 7) ★ 阈值变更后必须重建状态机(覆盖"恢复出厂改了阈值"这个场景) ★ ----
-     * 改阈值前已确认档位 3(Alarm)。把 alarmCm 抬到 50cm 后, 110mm=11cm 只是 Warning。
-     * 【为什么这条能证明重建发生过】若状态机没重建, 它仍认为"已确认 Alarm",
-     * 同值再喂永远不会报迁移 —— 所以"第 2 次喂才迁移到 Warning"恰好是重建的证据。 */
-    {
-        config_store_t *m = config_store_get_mut();
-
-        m->thresholds.alarm_cm = 50u;
-        CHECK(config_store_save(m) == CFG_OK, "准备: alarmCm 10 -> 50cm(配置版本 +1)");
-    }
-    cfg = config_store_get();
-
-    CHECK(last_value_update(uid, 110u, 70u, 0u, 1600u), "准备: 阈值变了, 再喂 110mm");
-    level_supervisor_poll(cfg, 1600u, &d);
-    CHECK(d.new_sample == true, "新上报");
-    CHECK(d.migrated == false, "重建后 confirmCount=2: 第 1 次不迁移");
-
-    CHECK(last_value_update(uid, 110u, 70u, 0u, 1700u), "准备: 再喂 110mm");
-    level_supervisor_poll(cfg, 1700u, &d);
-    CHECK(d.migrated == true, "★ 第 2 次一致 -> 迁移(证明状态机按新阈值重建了)");
-    CHECK(d.state == LEVEL_ST_WARNING, "★ 新阈值下 110mm=11cm -> Warning (实际 %u)",
-          (unsigned)d.state);
-    CHECK(d.gear == 2u, "★ 档位 3 -> 2 (实际 %u)", (unsigned)d.gear);
-    CHECK(d.prev_state == LEVEL_ST_UNKNOWN,
-          "★ 阈值变更重建状态机后, 迁移前状态又是 UNKNOWN (实际 %u)",
-          (unsigned)d.prev_state);
-
-    /* 收尾 */
-    last_value_set_now_hook(NULL);
-    last_value_reset();
-    level_supervisor_init();
-}
-
-/* =================================================================
- * [35] 液位全部失联的 fail-safe(文档第 5 章, 用户 2026-09-30 第 7 条)
- * -----------------------------------------------------------------
- * 关键点: "全部失联"是【时间】条件, 不是"来了新样本"才成立 —— 恰恰相反,
- * 一台都不报的时候永远没有新样本。所以这里必须验: 没有 new_sample 时,
- *  fail-safe 照样要判出来(否则这条策略等于不存在)。
- * ================================================================= */
-static void test_failsafe(void)
-{
-    level_decision_t      d;
-    const config_store_t *cfg;
-    uint8_t               uid[13];
-    uint32_t              t_out;
-    uint16_t              period;
-
-    printf("\n[35] 全部失联 fail-safe (sensorOfflinePolicy)\n");
-
-    cloud_live_reset(3u);
-    last_value_reset();
-    last_value_set_now_hook(NULL);
-    level_supervisor_init();
-
-    /* ★ 用例自备前提 ★ 本套件前面的用例改过 thresholds(把 alarmCm 抬到 50cm),
-     * 而 config_store 的 RAM 实例是"惰性加载一次"的 —— cloud_live_reset() 只重置了
-     * 传感器/设备表, 阈值仍是上一用例留下的值。不显式摆好, 110mm 会落在 Warning
-     * 而不是 Alarm, 档位断言就会莫名其妙地差一档。 */
-    config_store_get_mut()->thresholds.alarm_cm             = 10u;
-    config_store_get_mut()->thresholds.warning_cm           = 7u;
-    config_store_get_mut()->thresholds.resolve_cm           = 2u;
-    config_store_get_mut()->thresholds.min_change_cm        = 1u;
-    config_store_get_mut()->thresholds.event_min_interval_s = 0u;
-    config_store_get_mut()->thresholds.confirm_count        = 1u;   /* 一条即确认 */
-    config_store_get_mut()->rules.mode = (uint8_t)CFG_RULE_AUTO;
-    CHECK(config_store_save(config_store_get_mut()) == CFG_OK, "准备: 阈值/模式摆成已知值");
-    cfg = config_store_get();
-
-    CHECK(cfg_uid_to_bytes(cfg->sensors[0].uid, uid), "准备: 取到传感器 uid");
-    period = cfg->sensors[0].report_period_s;
-    CHECK(period > 0u, "准备: 上报周期 = %us", (unsigned)period);
-
-    /* 先在 t=1000ms 喂一条有效水位 -> 档位被确认(confirmCount=1), 之后才有
-     * "保持/强制"的对象 */
-    (void)last_value_update(uid, 110u, 70u, 0u, 1000u);
-    level_supervisor_poll(cfg, 1000u, &d);
-    CHECK(d.have_level == true, "准备: 有有效水位");
-    CHECK(d.failsafe == false, "有水位时不是 fail-safe");
-    CHECK(d.gear == 3u, "准备: 档位已确认 = 3 (实际 %u), 才有 keep 的对象",
-          (unsigned)d.gear);
-
-    /* 把时刻推到"最后一次上报 + 3×周期"之后 -> 全部超时 */
-    t_out = 1000u + sensor_offline_threshold_ms(period) + 1u;
-
-    /* ---- alarm: 强制档位 3 ---- */
-    config_store_get_mut()->rules.sensor_offline_policy = (uint8_t)CFG_OFFLINE_ALARM;
-    CHECK(config_store_save(config_store_get_mut()) == CFG_OK, "准备: 策略=alarm");
-
-    level_supervisor_poll(cfg, t_out, &d);
-    CHECK(d.failsafe == true, "★ 全部超时 -> 进入 fail-safe");
-    CHECK(d.new_sample == false,
-          "★ 此时【没有】新样本 —— 所以 fail-safe 不能挂在 new_sample 上");
-    CHECK(d.failsafe_enter == true, "★ 首次跌入 -> 边沿为真(上面只该动作一次)");
-    CHECK(d.failsafe_gear == 3u, "★ alarm -> 应执行档位 3 (实际 %u)",
-          (unsigned)d.failsafe_gear);
-
-    level_supervisor_poll(cfg, t_out + 1000u, &d);
-    CHECK((d.failsafe == true) && (d.failsafe_enter == false),
-          "★ 持续失联时边沿不再触发(不会每秒重发一次强制动作)");
-
-    /* ---- off: 档位 0 ---- */
-    config_store_get_mut()->rules.sensor_offline_policy = (uint8_t)CFG_OFFLINE_OFF;
-    (void)config_store_save(config_store_get_mut());
-    level_supervisor_poll(cfg, t_out + 2000u, &d);
-    CHECK(d.failsafe_gear == 0u, "★ off -> 档位 0");
-
-    /* ---- keep: 保持当前档位(前面已确认是 3) ---- */
-    config_store_get_mut()->rules.sensor_offline_policy = (uint8_t)CFG_OFFLINE_KEEP;
-    (void)config_store_save(config_store_get_mut());
-    level_supervisor_poll(cfg, t_out + 3000u, &d);
-    CHECK(d.failsafe_gear == 3u, "★ keep -> 保持当前档位 (实际 %u)",
-          (unsigned)d.failsafe_gear);
-
-    /* ---- 有上报回来 -> 退出 fail-safe ---- */
-    (void)last_value_update(uid, 110u, 70u, 0u, t_out + 4000u);
-    level_supervisor_poll(cfg, t_out + 4000u, &d);
-    CHECK(d.failsafe == false, "★ 重新收到上报 -> 退出 fail-safe");
-
-    /* 收尾: 策略回到出厂默认 keep */
-    config_store_get_mut()->rules.sensor_offline_policy = (uint8_t)CFG_OFFLINE_KEEP;
-    (void)config_store_save(config_store_get_mut());
-}
-
-/* =================================================================
+}/* =================================================================
  * [35] cfg.query 的 sections 参数 (v55)
  * -----------------------------------------------------------------
  * 文档本来就有按域查询, 此前只认 "all"、其余一律 1001。本版补齐。
@@ -3441,16 +2670,18 @@ static void test_cfg_sections(void)
           "sensors 内容与全量一致(1 台, 实际 %u)",
           (unsigned)cj_count(s_big_resp, "data.sensors"));
 
-    /* ---- 3) 域名数组 + 键序仍与写入器同源 ---- */
+    /* ---- 3) 域名数组 + 键序仍与写入器同源 ----
+     * 毕设版 cfg 域只剩 6 个(system/network/sensors/thresholds/ota/meta),
+     * gears/devices/rules 已删除, 不再作为合法域名。 */
     rc = cloud_proto_handle("{\"cmd\":\"cfg.query\",\"msgId\":\"cs3\",\"ts\":1,"
-                            "\"data\":{\"sections\":[\"gears\",\"rules\"]}}",
+                            "\"data\":{\"sections\":[\"system\",\"network\"]}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "sections=[gears,rules] -> 成功 (rc=%d)", rc);
-    CHECK(strstr(s_big_resp, "\"gears\"") != NULL, "有 gears");
-    CHECK(strstr(s_big_resp, "\"rules\"") != NULL, "有 rules");
+    CHECK(rc == CLOUD_EC_OK, "sections=[system,network] -> 成功 (rc=%d)", rc);
+    CHECK(strstr(s_big_resp, "\"system\"") != NULL, "有 system");
+    CHECK(strstr(s_big_resp, "\"network\"") != NULL, "有 network");
     CHECK(strstr(s_big_resp, "\"sensors\"") == NULL, "★ 没有 sensors");
-    CHECK(strstr(s_big_resp, "\"gears\"") < strstr(s_big_resp, "\"rules\""),
-          "键序: gears 在 rules 之前(与写入器同源)");
+    CHECK(strstr(s_big_resp, "\"system\"") < strstr(s_big_resp, "\"network\""),
+          "键序: system 在 network 之前(与写入器同源)");
 
     /* ---- 4) "all" 两种写法都还是全量 ---- */
     rc = cloud_proto_handle("{\"cmd\":\"cfg.query\",\"msgId\":\"cs4\",\"ts\":1,"
@@ -3494,10 +2725,9 @@ static void test_cfg_sections(void)
 
     rc = cloud_proto_handle("{\"cmd\":\"cfg.query\",\"msgId\":\"cs11\",\"ts\":1,"
                             "\"data\":{\"sections\":[\"system\",\"network\",\"sensors\","
-                            "\"thresholds\",\"gears\",\"devices\",\"rules\",\"ota\",\"meta\","
-                            "\"system\"]}}",
+                            "\"thresholds\",\"ota\",\"meta\",\"system\"]}}",
                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "条数 > 9 -> 1001 (rc=%d)", rc);
+    CHECK(rc == CLOUD_EC_PARAM, "条数 > 6 -> 1001 (rc=%d)", rc);
 }
 
 /* =================================================================
@@ -4671,181 +3901,6 @@ static void test_unix_to_calendar(void)
     CHECK(cloud_proto_unix_to_calendar(0u, 0, &y, &mo, &d, &h, &mi, NULL) == false,
           "second=NULL -> false");
 }
-
-/* =================================================================
- * dev.ctrl 手动控制(文档 5.4 第 14 条, 用户 2026-09-30 第 6 条)
- * -----------------------------------------------------------------
- * 验三件事:
- *   ① 参数按口径落到下行链上("all" -> only_uid=NULL; 指定 uid -> 原样传下去);
- *   ② ledText/ttsText 覆盖能到手;
- *   ③ 执行后【进入 manual 模式】(写进配置), 参数非法/无目标时的错误码正确。
- * ================================================================= */
-static void test_dev_ctrl(void)
-{
-    uint16_t rl;
-    int      rc;
-
-    printf("\n[36] dev.ctrl (手动控制 + 进 manual)\n");
-
-    cloud_live_reset(3u);                 /* 1 传感器 + 1 设备(310001) */
-    fake_lora_business_reset();
-
-    /* ---- 1) uid="all" -> only_uid 必须是 NULL(全部启用设备) ---- */
-    fake_gear_total = 1;  fake_gear_ret = 1;  fake_gear_res_code = 0u;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct1\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"all\",\"gear\":2}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.ctrl all gear=2 -> OK (rc=%d)", rc);
-    CHECK((fake_gear_calls == 1) && (fake_gear_uid_is_null == 1),
-          "★ \"all\" 被翻译成 only_uid=NULL(交给 gears[].targets 规则)");
-    CHECK(fake_gear_last_gear == 2, "★ 档位 2 传到了下发链 (实际 %d)", fake_gear_last_gear);
-    CHECK(strstr(s_big_resp, "\"results\"") != NULL, "应答带 data.results[]");
-    CHECK(strstr(s_big_resp, "\"uid\":\"31000000000000000000000001\"") != NULL, "results 里带 uid");
-    CHECK(strstr(s_big_resp, "\"code\":0") != NULL, "results 里带 code 0");
-    CHECK(config_store_get()->rules.mode == (uint8_t)CFG_RULE_MANUAL,
-          "★ 执行后进入 manual 模式(RAM 已切)");
-    CHECK(strstr(s_big_resp, "\"configVersion\"") != NULL, "应答带 configVersion");
-
-    /* ---- 1b) ★2026-11-02: dev.ctrl 不许写 Flash / 不许抬版本号 ---- */
-    {
-        uint16_t ver_before   = config_store_version();
-        uint16_t touch_before = level_supervisor_manual_cmd_seq();
-
-        fake_lora_business_reset();
-        fake_gear_total = 1;  fake_gear_ret = 1;
-        rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct1b\",\"ts\":1,"
-                                "\"data\":{\"uid\":\"all\",\"gear\":1}}",
-                                1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-        CHECK(rc == CLOUD_EC_OK, "再次 dev.ctrl -> OK (rc=%d)", rc);
-        CHECK(config_store_version() == ver_before,
-              "★★ 手动控制【不抬 configVersion】(前后都是 %u)", (unsigned)ver_before);
-        CHECK(level_supervisor_manual_cmd_seq() == (uint16_t)(touch_before + 1u),
-              "★ 但会通知 service 层'手动窗口重新计时'一次");
-        CHECK(config_store_get()->rules.mode == (uint8_t)CFG_RULE_MANUAL,
-              "★ RAM 里仍是 manual");
-    }
-
-    /* ---- 2) 指定 uid + 文本覆盖 ---- */
-    fake_lora_business_reset();
-    fake_gear_total = 1;  fake_gear_ret = 1;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct2\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\",\"gear\":3,"
-                            "\"ledText1\":\"手动测试\",\"ledText2\":\"第二段\","
-                            "\"ttsText\":\"手动语音\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "指定 uid -> OK (rc=%d)", rc);
-    CHECK((fake_gear_uid_is_null == 0) && (strcmp(fake_gear_last_uid, "31000000000000000000000001") == 0),
-          "★ 指定 uid 原样传给下发链 (实际 \"%s\")", fake_gear_last_uid);
-    /* ★2026-10-08: 覆盖参数由 ledText 改成 ledText1 / ledText2(方案 A)★ */
-    CHECK(strcmp(fake_gear_last_led, "手动测试") == 0,
-          "★ ledText1 覆盖生效 (实际 \"%s\")", fake_gear_last_led);
-    CHECK(strcmp(fake_gear_last_tts, "手动语音") == 0,
-          "★ ttsText 覆盖生效 (实际 \"%s\")", fake_gear_last_tts);
-
-    /* ---- 2b) ★2026-10-24 回归: 只给 ledText1, 没给的 tts 必须为空 ★ ----
-     * 旧逻辑会把"没给的字段"拿 gears[gear] 的模板渲染后填上去, 现象是
-     * dev.ctrl 只发 ledText1("早上好"), 设备却同时收到档位模板的 TTS/LED2。
-     * 手动控制必须透传: 没给就是空。 */
-    fake_lora_business_reset();
-    fake_gear_total = 1;  fake_gear_ret = 1;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct2b\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\",\"gear\":3,"
-                            "\"ledText1\":\"早上好\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "只给 ledText1 -> OK (rc=%d)", rc);
-    CHECK(strcmp(fake_gear_last_led, "早上好") == 0,
-          "★ 给的 ledText1 原样下发 (实际 \"%s\")", fake_gear_last_led);
-    CHECK(fake_gear_last_tts[0] == '\0',
-          "★★ 没给的 ttsText 必须为空, 不得自动填档位模板 (实际 \"%s\")",
-          fake_gear_last_tts);
-
-    /* ---- 3) 目标不存在(total=0) -> 1003 ---- */
-    fake_lora_business_reset();
-    fake_gear_total = 0;  fake_gear_ret = 0;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct3\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"31000000000000000000000001\",\"gear\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_NO_DEVICE, "★ 一台都没选中 -> 1003 (rc=%d)", rc);
-
-    /* ---- 4) 参数校验 ---- */
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct4\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"all\",\"gear\":4}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "gear=4(越界) -> 1001 (rc=%d)", rc);
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct5\",\"ts\":1,"
-                            "\"data\":{\"gear\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "缺 uid -> 1001 (rc=%d)", rc);
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct6\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"12\",\"gear\":1}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "uid 不是 6 位 hex -> 1001 (rc=%d)", rc);
-
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct7\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"all\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "缺 gear -> 1001 (rc=%d)", rc);
-
-    /* ---- 5) 非法参数不应该碰下发链 ---- */
-    {
-        int calls_before = fake_gear_calls;
-
-        (void)cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"ct8\",\"ts\":1,"
-                                 "\"data\":{\"uid\":\"all\",\"gear\":9}}",
-                                 1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-        CHECK(fake_gear_calls == calls_before, "★ 非法 gear 没到下发链(前置校验拦住)");
-    }
-
-    /* ---- 6) ★2026-11-11: voice 覆盖(云端码 -> 设备号) ----
-     *   「dev.ctrl 带 voice 却改不了音色」是 2026-11-11 用户实测出来的:
-     *   以前 voice 被【静默忽略】—— 平台发 54, 设备照旧播档位配置的音色。
-     *   这里钉住三件事: 换算的正确性(54->4)、非法码回 1001、不给就不覆盖。 */
-    fake_lora_business_reset();
-    fake_gear_total = 1;  fake_gear_ret = 1;
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"cv1\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"all\",\"gear\":3,\"voice\":54,"
-                            "\"ttsText\":\"你好\"}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_OK, "dev.ctrl 带 voice=54 -> OK (rc=%d)", rc);
-    CHECK(fake_voice_at_apply == 4,
-          "★ 云端 54(唐老鸭) -> 设备 4 交给了业务层 (实际 %d)", fake_voice_at_apply);
-    CHECK(fake_style_cleared > 0 && fake_last_voice_override == 0xFF,
-          "★ 下发后覆盖被清掉(不会粘到下一次自动联动)");
-
-    fake_lora_business_reset();
-    (void)cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"cv2\",\"ts\":1,"
-                             "\"data\":{\"uid\":\"all\",\"gear\":3,\"voice\":55}}",
-                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(fake_voice_at_apply == 5,
-          "★ 云端 55(艾彤) -> 设备 5 (实际 %d)", fake_voice_at_apply);
-
-    fake_lora_business_reset();
-    (void)cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"cv3\",\"ts\":1,"
-                             "\"data\":{\"uid\":\"all\",\"gear\":3,\"voice\":53}}",
-                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(fake_voice_at_apply == 3,
-          "云端 53(艾琪) -> 设备 3 (实际 %d)", fake_voice_at_apply);
-
-    fake_lora_business_reset();
-    rc = cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"cv4\",\"ts\":1,"
-                            "\"data\":{\"uid\":\"all\",\"gear\":3,\"voice\":56}}",
-                            1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(rc == CLOUD_EC_PARAM, "★ voice=56(非法) -> 1001 (rc=%d)", rc);
-    CHECK(fake_gear_calls == 0, "★ 非法 voice 不发帧(不静默用默认音色发出去)");
-
-    fake_lora_business_reset();
-    (void)cloud_proto_handle("{\"cmd\":\"dev.ctrl\",\"msgId\":\"cv5\",\"ts\":1,"
-                             "\"data\":{\"uid\":\"all\",\"gear\":3}}",
-                             1u, s_big_resp, (uint16_t)sizeof(s_big_resp), &rl);
-    CHECK(fake_voice_at_apply == 0xFF, "不给 voice -> 不覆盖(用档位配置的音色)");
-
-    /* 收尾: 把模式摆回 auto, 免得影响后面的用例(共享配置) */
-    config_store_get_mut()->rules.mode = (uint8_t)CFG_RULE_AUTO;
-    CHECK(config_store_save(config_store_get_mut()) == CFG_OK, "收尾: 恢复 auto");
-}
-
 /* ============================================================================
  * [OTA] ota.start / ota.query / ota.abort —— 命令层的错误码映射
  * ----------------------------------------------------------------------------
@@ -5017,26 +4072,19 @@ int main(void)
     test_factory_reset();
     test_sensor_offline_logic();
     test_msgid_idempotent();
-    test_unbind_and_rule_mode();
     test_set_entry();
-    test_rule_query();
     test_sys_reboot();
     test_sys_query_status();
     test_telemetry_data();
     test_event_data();
-    test_action_and_buffered();
-    test_rule_set();
     test_sys_time_sync();
     test_bind();
     test_sen_dev_query();
-    test_level_supervisor();
-    test_failsafe();
     test_cfg_sections();
     test_event_cache();
     test_low_voltage_latest();
     test_render_cached_event();
     test_backfill_page();
-    test_dev_ctrl();
 
     printf("\n==== 通过 %d, 失败 %d ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

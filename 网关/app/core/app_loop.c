@@ -21,7 +21,9 @@
 #include "config_store.h"
 #include "g4_at.h"
 #include "g4_urc.h"
-#include "level_supervisor.h"
+#include "level_eval.h"     /* level_state_of / level_state_to_gear: 给状态打标签 */
+#include "last_value.h"     /* last_value_get: 算有效水位 */
+#include "sensor_offline.h" /* sensor_offline_threshold_ms: 在线判据 */
 #include "lora_business.h"
 #include "ota_health.h"
 #include "flash_map.h"
@@ -30,6 +32,53 @@
 #include "xflash_store.h"   /* xf_ring_poll: 外挂 Flash 环指针按 30s 空闲落盘 */
 #include "xf_log.h"         /* xf_log_poll: 日志行落进 LOG 环 */
 #include "event_cache.h"    /* event_cache_poll: 待提交槽 1s 到点落盘 */
+
+/**
+ * @brief 刷新"当前水位状态/档位"标签(毕设版: 纯数据, 无联动)
+ *
+ * 从各在线且启用的液位传感器里取最大水位, 按阈值映射成状态与档位,
+ * 存进 app_state 供 status.report / telemetry 打标签。
+ * 不防抖、不下发、不产生事件 —— 那些联动逻辑已随一体机删除。
+ */
+static void loop_refresh_level_label(void)
+{
+    const config_store_t *cfg = config_store_get();
+    int32_t  levels[CFG_SENSOR_MAX];
+    uint8_t  select[CFG_SENSOR_MAX];
+    int32_t  eff = 0;
+    uint8_t  i;
+    uint8_t  n;
+    uint32_t now = get_tick_ms();
+
+    if (cfg == NULL) { return; }
+
+    n = (cfg->sensor_count > (uint8_t)CFG_SENSOR_MAX) ? (uint8_t)CFG_SENSOR_MAX
+                                                      : cfg->sensor_count;
+    for (i = 0u; i < n; i++)
+    {
+        const cfg_sensor_t *s = &cfg->sensors[i];
+        uint8_t      uid[CFG_UID_BYTES];
+        last_value_t lv;
+
+        levels[i] = 0;
+        select[i] = 0u;
+        if (s->enabled == 0u) { continue; }
+        if (!cfg_uid_to_bytes(s->uid, uid)) { continue; }
+        if (!last_value_get(uid, &lv)) { continue; }
+        if ((uint32_t)(now - lv.rx_tick_ms) >= sensor_offline_threshold_ms(s->report_period_s))
+        {
+            continue;
+        }
+        levels[i] = lv.level_mm;
+        select[i] = 1u;
+    }
+
+    if (level_effective(levels, select, n, &eff))
+    {
+        level_state_t st = level_state_of(eff, &cfg->thresholds);
+        app_note_level((uint8_t)st, level_state_to_gear(st));
+    }
+}
 
 void app_loop_run(void)
 {
@@ -137,117 +186,12 @@ void app_loop_run(void)
              * 心跳 2s 后重试), 不需要在这里加互斥或延时。 */
             app_mgmt_online_poll(g4_at_is_online());
 
-            /* ---- 边缘水位评估(v54): 复用这同一个 1s 节拍, 【不新增定时器】 ----
-             * 文档 4 章的自治核心: 有效水位(max) -> confirmCount 防抖 -> 档位 ->
-             * 模板渲染 -> 该不该下发。算法在 level_eval.c, 取数+串接在 level_supervisor.c。
-             * ★ 每秒调一次【不会】把 confirmCount 变成"立刻满足": level_supervisor_poll()
-             *   只在检测到【新上报】时才推进算法(按 last_value 的更新计数判)。
-             *
-             * 【2026-09-30 用户第 2 条: 最后一跳接上了】
-             *   以前这里只"评估 + 记日志"。现在真的把档位动作下发到联动设备:
-             *     level_supervisor_poll() 算出 dispatch -> lora_business_apply_gear()
-             *     按 gears[] 模板组帧投递 -> 发【成功】才 level_supervisor_mark_sent()
-             *     (失败不 mark, 下次有新上报时会自动重试)。
-             *   注意 dispatch 与 migrated 是【两个判据】: migrated 管"要不要上报
-             *   status_change", dispatch 管"要不要下发联动"(档位变【或】文案变),
-             *   所以下面分成两个 if, 不能合并。 */
-            {
-                level_decision_t ld;
-
-                level_supervisor_poll(config_store_get(), get_tick_ms(), &ld);
-
-                /* 缓存最近一次【有效】评估结果: status.report / telemetry 要用它取
-                 * 实时档位与状态(第 10 条: 以前那里硬编码 0/"auto") */
-                if (ld.new_sample && ld.have_level)
-                {
-                    app_note_decision(&ld);
-                }
-
-                /* ---- (D1) 联动下发: 判据是 dispatch ---- */
-                if (ld.new_sample && ld.have_level && ld.dispatch)
-                {
-                    uint8_t total = 0U;
-                    int     sent  = lora_business_apply_gear(ld.gear, ld.level_mm,
-                                                             ld.led_text1, ld.led_text2,
-                                                             ld.tts_text,
-                                                             &total);
-
-                    if (sent > 0)
-                    {
-                        /* 真发出去了 -> 记下档位/文案, 下次同样的内容不再重复下发 */
-                        level_supervisor_mark_sent(ld.gear, ld.led_text1, ld.led_text2);
-                    }
-                    else if (total == 0U)
-                    {
-                        /* 压根没有"启用的"联动设备: 这是配置事实, 不是发送失败。
-                         * 也 mark(否则每来一次上报都会重试一次, 日志被刷满)。 */
-                        level_supervisor_mark_sent(ld.gear, ld.led_text1, ld.led_text2);
-                        log_info("[LEVEL] 档位 %u 无启用的联动设备, 视为已处理\r\n",
-                                 (unsigned)ld.gear);
-                    }
-                    /* sent==0 且 total>0: 投递失败(载荷过长/从机表里没有) ->
-                     * 不 mark, 等下次上报重试。lora_business 那边已打原因。 */
-                }
-
-                /* ---- (D1a) 水位未变化 -> 给声光发 0x09 在线查询 ---- */
-                if (ld.new_sample && ld.have_level && (!ld.dispatch) &&
-                    (!ld.auto_suppressed) && (!ld.failsafe))
-                {
-                    lora_business_ping_alarms();
-                }
-
-                /* ---- (D1b) 全部失联 fail-safe(第 7 条): 边沿触发, 只做一次 ---- */
-                app_failsafe_step(&ld);
-
-                /* ---- (D2) 状态迁移上报: 判据是 migrated ---- */
-                if (ld.new_sample && ld.have_level && ld.migrated)
-                {
-                    log_info("[LEVEL] 迁移 -> state=%u gear=%u level=%ldmm led1=\"%s\" led2=\"%s\" 该下发=%u\r\n",
-                             (unsigned)ld.state, (unsigned)ld.gear,
-                             (long)ld.level_mm, ld.led_text1, ld.led_text2,
-                             (unsigned)ld.dispatch);
-
-                    /* ---- 【第 8 条】事件去抖真正生效 ----
-                     * migrated 只说明"状态被确认变了"; 文档 7.2 还要求
-                     * event.status_change 受 minChangeCm 与 eventMinIntervalSeconds 约束。
-                     * 这两个判据 level_eval 早就算好放在 ld.event_due 里了,
-                     * 但这里【以前从来没读它】—— 于是去抖形同不存在。
-                     * 现在: 不 due 就不发(也不 mark, 让下一条够格的样本能发出去)。 */
-                    if (!ld.event_due)
-                    {
-                        log_info("[LEVEL] 迁移事件被去抖拦下(变化 < %ucm 或间隔 < %us)\r\n",
-                                 (unsigned)config_store_get()->thresholds.min_change_cm,
-                                 (unsigned)config_store_get()->thresholds.event_min_interval_s);
-                    }
-                    else
-                    {
-                        /* ★ 在线直发 / 断线入缓存, 两支互斥 (v72) ★
-                         * 相关函数见上面 app_publish_status_change / app_cache_status_change。
-                         * 之前这里只有"入缓存"一支; 现在在线时也真的把 status_change 发出去了。 */
-                        if (g4_at_is_online())
-                        {
-                            app_publish_status_change((uint8_t)ld.prev_state, (uint8_t)ld.state,
-                                                       ld.gear, ld.level_mm);
-                        }
-                        else
-                        {
-                            app_cache_status_change((uint8_t)ld.prev_state, (uint8_t)ld.state,
-                                                     ld.gear, ld.level_mm);
-                        }
-
-                        /* 事件【已生成】(直发或入缓存都算) -> 记下基准, 供下一次去抖比较。
-                         * ★ 不在这里留"失败重试"的口子: 入缓存那条本来就是断线补报的入口;
-                         *   直发失败也只影响这一条, 下一个够格的样本会再发一条新事件。 */
-                        level_supervisor_mark_event(ld.level_mm, get_tick_ms());
-                    }
-                }
-
-                /* ---- (D3) 水位遥测上行(第 3 条): 周期 or 变化量触发 ---- */
-                app_telemetry_step();
-
-                /* ---- (D4) manual 模式窗口(第 6 条): 到期自动回归 auto ---- */
-                app_manual_step();
-            }
+            /* ---- 水位状态标签 + 遥测上行(毕设版: 纯数据, 无联动) ----
+             * 有效水位(max) -> 阈值判状态 -> 存状态/档位标签;
+             * 没有防抖、没有档位下发、没有 state_change 事件、没有 fail-safe、
+             * 没有 manual 窗口 —— 这些一体机联动逻辑已全部删除。 */
+            loop_refresh_level_label();
+            app_telemetry_step();
 
             /* ---- 断线补报: 每次最多补一页(16 条), 缓存空了立刻返回 (v70) ---- */
             app_backfill_poll();

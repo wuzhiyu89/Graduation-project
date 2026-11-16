@@ -13,7 +13,6 @@
 
 #include "g4_at.h"            /* sys_err_t */
 #include "cloud_proto.h"      /* cloud_status_t */
-#include "level_supervisor.h" /* level_decision_t */
 #include "lora_business.h"    /* lora_bind_event_t / LORA_UID_BYTES */
 
 #ifdef __cplusplus
@@ -68,16 +67,9 @@ void app_on_sensor_event(const char *uid_hex, bool online);
 /* ★2026-10-22: 液位低电量 -> event.device / low_voltage */
 void app_on_sensor_low_battery(const char *uid_hex, uint8_t bat_pct);
 void app_on_field_result(bool ok, const char *field10);
-void app_publish_bind_event(const char *uid_hex, bool is_sensor,
-                            lora_bind_event_t event);
-void app_on_alarm_result(const char *uid_hex, uint8_t gear,
-                         bool ok, bool gave_up, bool recovered);
+void app_publish_bind_event(const char *uid_hex, lora_bind_event_t event);
 
-/* ---- 水位状态迁移（主循环直接调） ---- */
-void app_cache_status_change(uint8_t from_code, uint8_t to_code,
-                             uint8_t gear, int32_t level_mm);
-void app_publish_status_change(uint8_t from_code, uint8_t to_code,
-                               uint8_t gear, int32_t level_mm);
+/* 毕设版: alarm_result / status_change 事件已随一体机联动删除 */
 
 /* ---------------- 启动与主循环（都不返回） -------------------------------- */
 void app_boot_run(void);   /* 上电初始化序列 */
@@ -87,16 +79,7 @@ void app_loop_run(void);   /* 主循环，永不返回 */
 void app_mode_rawtest_run(void);   /* MAIN_MODE_LORA_TEST */
 void app_mode_pairing_run(void);   /* MAIN_MODE_PAIRING  */
 
-/* ---------------- 本地自治（水位 -> 联动） -------------------------------- */
-void app_failsafe_step(const level_decision_t *ld);   /* 全部失联 fail-safe */
-/** off fail-safe 的故障画面结果事件(trigger=failsafe)
- *  @param res 本次下发的逐台受理结果(可为 NULL)
- *  @param n   条数
- *  ★2026-11-02: 以前这条事件的 results 是空数组，而协议 §7.3 要求逐台给出
- *    code；现在把 lora_business_apply_fault_display() 的结果原样带上去。 */
-void app_event_action_failsafe(const lora_gear_result_t *res, uint8_t n);
-bool app_level_off_failsafe_active(void);              /* off 策略的故障画面期 */
-void app_manual_step(void);                            /* manual 窗口到期回归 */
+/* 毕设版: 本地联动(failsafe / manual / 档位动作)已随一体机删除 */
 #ifdef __cplusplus
 }
 #endif

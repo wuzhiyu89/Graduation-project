@@ -37,7 +37,7 @@ void data_cache_init(void)
 void data_cache_up_push(const uint8_t *uid, uint16_t level_mm, uint16_t bat_pct,
                         uint32_t time_mdhhm, int8_t rssi_dbm)
 {
-    /* 【记录"最后值"快照】供 sen.query / dev.query 按 uid 查最近一次上报,
+    /* 【记录"最后值"快照】供 sen.query 按 uid 查最近一次上报,
      * 也供 main.c 组装 rt/gw/{gwId}/telemetry 的 JSON。
      *
      * 本函数是【所有传感器上报的唯一漏斗】, 所以放在这里 —— 调用方一行都不用改。
@@ -69,7 +69,7 @@ void data_cache_up_push(const uint8_t *uid, uint16_t level_mm, uint16_t bat_pct,
 }
 
 /********************* 下发缓存实现 *********************/
-int data_cache_down_push(uint8_t *uid, slave_type_t dev_type, uint8_t *buf, uint8_t len)
+int data_cache_down_push(uint8_t *uid, uint8_t *buf, uint8_t len)
 {
     if (len > sizeof(g_cache_down_buf[0].payload)) return -1;
     /* 先判断该uid是否已经存在待下发条目，存在则覆盖旧的 */
@@ -78,7 +78,6 @@ int data_cache_down_push(uint8_t *uid, slave_type_t dev_type, uint8_t *buf, uint
         if(g_cache_down_buf[i].valid == true && (memcmp(g_cache_down_buf[i].dev_uid, uid, sizeof(((last_value_t*)0)->uid)) == 0))
         {
             memcpy(g_cache_down_buf[i].dev_uid, uid, sizeof(((last_value_t*)0)->uid));
-            g_cache_down_buf[i].dev_type = dev_type;
             memcpy(g_cache_down_buf[i].payload, buf, len);
             g_cache_down_buf[i].pay_len = len;
             g_cache_down_buf[i].valid = true;
@@ -91,7 +90,6 @@ int data_cache_down_push(uint8_t *uid, slave_type_t dev_type, uint8_t *buf, uint
         if(g_cache_down_buf[i].valid == false)
         {
             memcpy(g_cache_down_buf[i].dev_uid, uid, sizeof(((last_value_t*)0)->uid));
-            g_cache_down_buf[i].dev_type = dev_type;
             memcpy(g_cache_down_buf[i].payload, buf, len);
             g_cache_down_buf[i].pay_len = len;
             g_cache_down_buf[i].valid = true;
@@ -127,16 +125,9 @@ void data_cache_down_del_by_uid(uint8_t *uid)
     }
 }
 
-/* ★2026-10-23 P1: "删之前先确认缓存里还是刚发出去的那一条"★
- *
- * 【为什么需要】声光(0x03)是三段式: 0x80 收到 -> 等约 10 秒 -> 0x82 执行结果。
- * 这 10 秒里云端完全可能又下发一条新档位, 覆盖掉同一个 uid 的缓存条目
- * (缓存是"每台一条", 后到的直接顶掉前一条)。
- * 老代码在收到 0x82 时【无条件】按 uid 删缓存 —— 于是那条【新指令】被连带删掉:
- * 平台以为下发成功, 设备停在旧档位, 而且再也没有重试机会。
- *
- * 【现在的语义】只有"缓存的 func 和载荷与刚发出去的那条逐字节相同"才删。
- * 不同 = 已经有更新的指令在排队, 保留它交给下一轮下发。 */
+/* "删之前先确认缓存里还是刚发出去的那一条"：
+ * 等待设备 ACK 期间，云端可能又下发一条新指令覆盖同一 uid 的缓存条目。
+ * 若按 uid 无条件删，会把新指令一起删掉；因此只有 func 和载荷都一致时才删。 */
 bool data_cache_down_del_if_match(uint8_t *uid, uint8_t func, const uint8_t *data, uint8_t len)
 {
     for(uint8_t i = 0; i < DATA_CACHE_DOWN_MAX_ITEM; i++)

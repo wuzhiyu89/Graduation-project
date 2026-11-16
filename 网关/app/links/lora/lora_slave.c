@@ -2,8 +2,8 @@
  * @file  lora_slave.c
  * @brief LoRa 从机表：hex 工具 / 设备类型判定 / 运行期表装载与增删 / 在线状态查询
  *
- * 表是【动态】的：lora_business_init() 时从 config_store 的 sensors[]/devices[]
- * 装载；运行期由绑定(0x04) / 解绑(0x05) 增删。
+ * 表是【动态】的：lora_business_init() 时从 config_store 的 sensors[] 装载；
+ * 运行期由绑定(0x04) / 解绑(0x05) 增删。
  *
  * 对外只通过 lora_internal.h 暴露：查找、摸一下(标记在线)、增、删、装载，
  * 以及"某台设备到底算在线还是离线"的查询。别的模块不要自己遍历 g_slave_list。
@@ -18,8 +18,8 @@
 #include "bsp_tim.h"      /* get_tick_ms */
 #include "log.h"
 
-/* 从机表容量 = 传感器槽 + 设备槽(真正的容量约束在 config_store_can_add)。 */
-#define LORA_SLAVE_MAX  (CFG_SENSOR_MAX + CFG_DEVICE_MAX)
+/* 从机表容量 = 传感器槽（毕设版只有液位传感器）。 */
+#define LORA_SLAVE_MAX  CFG_SENSOR_MAX
 
 lora_slave_t g_slave_list[LORA_SLAVE_MAX];
 uint8_t      g_slave_count = 0U;
@@ -93,8 +93,8 @@ static uint16_t lora_hex_bin2str(const uint8_t *in, uint16_t in_len, char *out, 
 /* ==================== 设备类型的判断规则(现场规则) ====================
  *
  * 【设备 UID 首字节的高半字节就是设备类型】
- *     0x1x = 网关      0x2x = 液位传感器      0x3x = 声光报警器
- *   低半字节是环境 ID, 所以环境 1 下就是 0x11 / 0x21 / 0x31。
+ *     0x1x = 网关      0x2x = 液位传感器
+ *   低半字节是环境 ID, 所以环境 1 下就是 0x11 / 0x21。
  *
  * UID 是【13 字节】(2026-10-18 起全设备统一, hex 串固定 26 位):
  *     [0] = (类型 << 4) | 环境ID, [1..12] = 芯片 96 位 UID 原样搬运。
@@ -105,11 +105,10 @@ static uint16_t lora_hex_bin2str(const uint8_t *in, uint16_t in_len, char *out, 
  *    也没有 6 字符 hex 的设备 —— 不要把 26 位 hex 当成十进制数去解析。
  *
  * 【为什么要有这条规则】绑定/解绑场景里, 收到的 0x04 广播帧的 dev_uid 就是
- * 发起绑定的设备自己, 网关靠这条规则把它分到液位/声光槽里, 不用设备自报类型。
+ * 发起绑定的设备自己, 网关靠这条规则确认它是液位设备, 不用设备自报类型。
  */
 #define LORA_UID_TYPE_GW      1U
 #define LORA_UID_TYPE_LEVEL   2U
-#define LORA_UID_TYPE_ALARM   3U
 
 uint8_t lora_dev_type_of_uid(const uint8_t uid[CFG_UID_BYTES])
 {
@@ -152,9 +151,9 @@ uint8_t lora_slave_touch(const uint8_t uid[CFG_UID_BYTES])
 
 /* ---------- lora_slave_add: 往运行期表末尾追加一台 ----------
  * 由绑定流程在收到 0x04 广播帧且网关回了 ACK、设备也回 ACK 确认后调用。
- * 容量约束(总数≤5/液位≤4/声光≤3)由调用前 config_store_can_add 兜底,
+ * 容量约束由调用前 config_store_can_add 兜底,
  * 这里只保证 RAM 表不越界、不重复。返回索引; -1=表满/重复。 */
-int lora_slave_add(const uint8_t uid[CFG_UID_BYTES], slave_type_t type)
+int lora_slave_add(const uint8_t uid[CFG_UID_BYTES])
 {
     if (g_slave_count >= LORA_SLAVE_MAX) return -1;
     if (lora_slave_find(uid) != 0xFFU)       return -1;   /* 已在表里 */
@@ -163,7 +162,6 @@ int lora_slave_add(const uint8_t uid[CFG_UID_BYTES], slave_type_t type)
     lora_slave_t *s = &g_slave_list[idx];
     memset(s, 0, sizeof(*s));
     memcpy(s->dev_uid, uid, CFG_UID_BYTES);
-    s->dev_type  = type;
     s->state     = SLAVE_STATE_IDLE;
     s->is_online = true;                          /* 绑定当场就在线 */
     s->retry_cnt = 0U;
@@ -192,9 +190,8 @@ int lora_slave_del(const uint8_t uid[CFG_UID_BYTES])
 }
 
 /* ---------- 从 config_store 装载运行期表(init 时调一次) ----------
- * config_store 里的 sensors[](液位) 和 devices[](声光等联动设备) 是真相源,
- * 这里把它们的 uid 解成 13 字节填进 g_slave_list。
- * 顺序: 先 sensors 再 devices, 与 lora_slave_add 的末尾追加语义一致。 */
+ * config_store 里的 sensors[](液位) 是真相源，
+ * 这里把它们的 uid 解成 13 字节填进 g_slave_list。 */
 void lora_slave_load(void)
 {
     const config_store_t *cfg = config_store_get();
@@ -203,54 +200,32 @@ void lora_slave_load(void)
     memset(g_slave_list, 0, sizeof(g_slave_list));
     g_slave_count = 0U;
 
-    /* 液位传感器 → SLAVE_TYPE_SENSOR */
+    if (cfg == NULL) { return; }
+
     for (i = 0U; i < cfg->sensor_count && i < CFG_SENSOR_MAX; i++)
     {
-        if (g_slave_count >= LORA_SLAVE_MAX) break;
         uint8_t uid3[CFG_UID_BYTES];
+        if (g_slave_count >= LORA_SLAVE_MAX) break;
         if (!cfg_uid_to_bytes(cfg->sensors[i].uid, uid3)) continue;
-        lora_slave_t *s = &g_slave_list[g_slave_count];
-        memcpy(s->dev_uid, uid3, CFG_UID_BYTES);
-        s->dev_type  = SLAVE_TYPE_SENSOR;
-        s->state     = SLAVE_STATE_IDLE;
-        s->is_online = false;
-        g_slave_count++;
+        {
+            lora_slave_t *s = &g_slave_list[g_slave_count];
+            memcpy(s->dev_uid, uid3, CFG_UID_BYTES);
+            s->state     = SLAVE_STATE_IDLE;
+            s->is_online = false;
+            g_slave_count++;
+        }
     }
 
-    /* 联动设备(声光等) → SLAVE_TYPE_ALARM_OUT */
-    for (i = 0U; i < cfg->device_count && i < CFG_DEVICE_MAX; i++)
-    {
-        if (g_slave_count >= LORA_SLAVE_MAX) break;
-        uint8_t uid3[CFG_UID_BYTES];
-        if (!cfg_uid_to_bytes(cfg->devices[i].uid, uid3)) continue;
-        lora_slave_t *s = &g_slave_list[g_slave_count];
-        memcpy(s->dev_uid, uid3, CFG_UID_BYTES);
-        s->dev_type  = SLAVE_TYPE_ALARM_OUT;
-        s->state     = SLAVE_STATE_IDLE;
-        s->is_online = false;
-        g_slave_count++;
-    }
-
-    log_info("[GW] 从机表装载完成, 共 %u 台:\r\n", (unsigned)g_slave_count);
+    log_info("[GW] 从机表装载完成, 共 %u 台(全部为液位传感器):\r\n", (unsigned)g_slave_count);
     for (i = 0U; i < g_slave_count; i++)
     {
-        log_info("[GW]   [%u] dev=%02X%02X%02X type=%s\r\n", (unsigned)i,
+        log_info("[GW]   [%u] dev=%02X%02X%02X\r\n", (unsigned)i,
                  g_slave_list[i].dev_uid[0], g_slave_list[i].dev_uid[1],
-                 g_slave_list[i].dev_uid[2],
-                 (g_slave_list[i].dev_type == SLAVE_TYPE_SENSOR) ? "SENSOR(液位)"
-                                                                 : "ALARM_OUT(声光)");
+                 g_slave_list[i].dev_uid[2]);
     }
 }
 
-/* ==================================================================
- * ★2026-10-18: 设备在线/离线状态查询(给 sen.query / dev.query 的 online 用)
- * ------------------------------------------------------------------
- * 【为什么不能继续用 last_value 快照】那张表只有液位 0x02 会写, 声光从不进表
- *   ⇒ 声光的 online 恒 false, 平台会一直以为它掉了。
- * 【为什么声光不用 last_recv_tick】声光平时不收帧(只有下发 0x03 时才回 0x80/
- *   0x82/0x83), 用"多久没收到帧"判它失联, 会在没下发动作时【一直误判离线】。
- *   所以对它只认一条证据: 3 条 0x03 都没成功(alarm_offline_reported)。
- * ================================================================== */
+/* 给 sen.query 的 online 字段使用：直接从从机表读 is_online。 */
 lora_dev_state_t lora_business_device_state_bytes(const uint8_t uid[LORA_UID_BYTES])
 {
     uint8_t i;
@@ -266,14 +241,7 @@ lora_dev_state_t lora_business_device_state_bytes(const uint8_t uid[LORA_UID_BYT
 
         if (memcmp(s->dev_uid, uid, LORA_UID_BYTES) != 0) { continue; }
 
-        if (s->dev_type == SLAVE_TYPE_SENSOR)
-        {
-            return s->is_online ? LORA_DEV_STATE_ONLINE : LORA_DEV_STATE_OFFLINE;
-        }
-
-        /* 声光: 只有"3 条 0x03 都没成功"这一条确凿证据 */
-        return s->alarm_offline_reported ? LORA_DEV_STATE_OFFLINE
-                                         : LORA_DEV_STATE_ONLINE;
+        return s->is_online ? LORA_DEV_STATE_ONLINE : LORA_DEV_STATE_OFFLINE;
     }
 
     return LORA_DEV_STATE_UNKNOWN;      /* 不在从机表里 */

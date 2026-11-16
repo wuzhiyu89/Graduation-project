@@ -3,7 +3,8 @@
  * @brief 云平台协议路由层实现（见 cloud_proto.h）
  *
  * 下行：解析信封 -> 鉴权 -> msgId 幂等 -> 按命令名分发 -> 组应答。
- * 21 条命令的实现已按域拆到 cloud_cmd_*.c（sys / cfg / rule / devices / ota），
+ * 毕设版只有液位传感器：命令按域拆到 cloud_cmd_*.c（sys / cfg / devices(sen) / ota）。
+ * dev.* / rule.* 联动设备命令已删除。
  * 本文件只保留：信封解析与组包、幂等环、命令表、日历换算、cJSON 打印，
  * 以及 cfg 系列共用的"整份配置"暂存缓冲。
  *
@@ -15,10 +16,8 @@
 #include "cloud_profile.h"
 #include "lora_business.h"      /* sen.bind/dev.bind/sen.unbind/dev.unbind 异步对接 */
 #include "config_store.h"       /* cfg.set / cfg.query / sys.factory_reset */
-#include "last_value.h"         /* sen.query / dev.query 的"最近一次上报"时刻 */
-#include "level_eval.h"         /* 补报 status_change 时由"迁移后状态"推档位 */
-#include "level_supervisor.h"   /* dev.ctrl：给平台给的文本渲染 {level}(取当前水位) */
-#include "sensor_offline.h"     /* sen.query/dev.query 的 online 判据（与失联检测同一套） */
+#include "last_value.h"         /* sen.query 的"最近一次上报"时刻 */
+#include "sensor_offline.h"     /* sen.query 的 online 判据（与失联检测同一套） */
 #include "bsp_tim.h"            /* get_tick_ms() —— 上面那个判据的"当前时刻" */
 #include "cjson_port.h"         /* 信封层用 cJSON —— 必须先 cjson_port_init() 装静态池 hooks */
 #include "log.h"                /* 恢复出厂的失败原因必须留下日志 */
@@ -67,11 +66,12 @@ typedef struct
 /* 配置域名表：cfg.set/cfg.query 的 sections 过滤用（顺序 = 文档 3.2） */
 const char *const cloud_cfg_section_names[] =
 {
-    "system", "network", "sensors", "thresholds", "gears", "devices", "rules", "ota", "meta"
+    "system", "network", "sensors", "thresholds", "ota", "meta"
 };
 
 
-/* 21 条命令已全部接真实实现；占位函数 cloud_cmd_not_impl 于 2026-10-02 删除。 */
+/* 毕设版 13 条命令(sys/cfg/sen/ota)已全部接真实实现；
+ * dev. 与 rule. 系列联动设备命令已随一体机删除。 */
 
 /* ==================================================================
  * cfg.set / cfg.query 的实现（文档 gateway-protocol 5.2）
@@ -90,9 +90,6 @@ static const cfg_section_name_t s_section_names[] =
     { CFG_CH_NETWORK,    "network"    },
     { CFG_CH_SENSORS,    "sensors"    },
     { CFG_CH_THRESHOLDS, "thresholds" },
-    { CFG_CH_GEARS,      "gears"      },
-    { CFG_CH_DEVICES,    "devices"    },
-    { CFG_CH_RULES,      "rules"      },
     { CFG_CH_OTA,        "ota"        }
 };
 
@@ -378,22 +375,13 @@ static const cloud_cmd_entry_t s_cmd_table[] =
     /* 5~6 配置类: P2-4 已接真实实现 */
     { "cfg.set",           cloud_cmd_cfg_set   },
     { "cfg.query",         cloud_cmd_cfg_query },
-    /* 7~10 传感器类 */
+    /* 7~10 传感器类 (毕设只有液位) */
     { "sen.bind",          cloud_cmd_sen_bind },
     { "sen.unbind",        cloud_cmd_sen_unbind },
     { "sen.set",           cloud_cmd_sen_set },
     { "sen.query",         cloud_cmd_sen_query },
-    /* 11~15 联动设备类 */
-    { "dev.bind",          cloud_cmd_dev_bind },
-    { "dev.unbind",        cloud_cmd_dev_unbind },
-    { "dev.set",           cloud_cmd_dev_set },
-    { "dev.ctrl",          cloud_cmd_dev_ctrl },
-    { "dev.query",         cloud_cmd_dev_query },
-    /* 16~18 联动规则类 */
-    { "rule.set",          cloud_cmd_rule_set },
-    { "rule.query",        cloud_cmd_rule_query },
-    { "rule.mode",         cloud_cmd_rule_mode },
-    /* 19~21 升级类 —— 2026-10-02 起接真实实现(此前恒回 1006) */
+    /* 联动设备类 dev.* 与规则类 rule.* 已随一体机删除 */
+    /* 升级类 —— 接真实实现 */
     { "ota.start",         cloud_cmd_ota_start },
     { "ota.query",         cloud_cmd_ota_query },
     { "ota.abort",         cloud_cmd_ota_abort }

@@ -182,13 +182,8 @@ void app_boot_run(void)
      *    都会恒回 1006(云端再也绑不上设备) —— 2026-09-29 误删过一次。 */
     cloud_proto_set_pair_hook(lora_business_open_bind_window);
     lora_business_set_bind_event_cb(app_publish_bind_event);
-    /* ★2026-10-08 新增★ 声光(0x03)执行结果回调 -> event.action(+ 离线时补 event.device)
-     * 声光设备对 0x03 回 0x80(收到了) -> 0x82(成功)/0x83(失败), 见 lora_proto.h。
-     * ⚠️【别删】少了这一行, 声光状态机照样跑完 15 秒 x3 条的重试, 但结果
-     *   一个字都发不出去 —— 平台永远不知道灯亮没亮。 */
-    lora_business_set_alarm_result_cb(app_on_alarm_result);
     log_info("[BOOT] 绑定/解绑回调已挂载(pair_hook + bind_event -> event topic)\r\n");
-    log_info("[BOOT] 声光执行结果回调已挂载(0x82/0x83 -> event.action)\r\n");
+    /* 毕设版: 声光执行结果回调(0x82/0x83 -> event.action)已随一体机删除 */
 
     /* 射频健康自检: BUSY(PB3) 一直高 = LoRa 模组不应答(没电/EN没拉/没焊/线断)。
      * 单独打一行, 免得现场要去数 "wait busy pin timeout" 才知道射频是坏的。 */
@@ -225,13 +220,7 @@ void app_boot_run(void)
      *   ⚠️ 唯一要警惕的: 固定 clientID + 同一个 broker = 多台网关互相顶下线。
      *      单台测试没问题; 上第二台时把 `network.clientId` 配成唯一值(或 "IMEI")。 */
     {
-        /* ★2026-10-27 用户要求: 上电强制回 auto★
-         * 只改 RAM, 不写 Flash(不抬 configVersion); 每次上电都生效。 */
-        if (config_store_get()->rules.mode == (uint8_t)CFG_RULE_MANUAL)
-        {
-            config_store_get_mut()->rules.mode = (uint8_t)CFG_RULE_AUTO;
-            log_info("[BOOT] 上电强制回 auto(manual 不跨重启保持, RAM-only)\r\n");
-        }
+        /* 毕设版: rules.mode 上电回 auto 的逻辑已随联动规则删除 */
 
         const config_store_t *cfg = config_store_get();
         const char *dev_id = ((cfg != NULL) && (cfg->system.gw_id[0] != '\0'))

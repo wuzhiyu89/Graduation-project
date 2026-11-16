@@ -6,12 +6,7 @@
  *   云或本地业务 --投递--> data_cache(每台一条) --lora_try_send_downlink--> 空口
  *     -> WAIT_ACK: 收到 ACK 清缓存；超时重传 3 次，耗尽丢弃（不无限重发）
  *
- * 两条时间线：
- *   · 液位是休眠设备：收到 0x02 后"先回 0x80，再等 3s 下发"（lora_reply_*）；
- *   · 声光是常驻 RX：lora_try_send_alarm_idle() 每秒扫 IDLE 的声光设备主动发。
- *
- * 0x03 的执行结果（0x82/0x83）不在本文件 —— 见 lora_alarm.c；本文件只在
- * 发送咽喉里给 alarm_attempts/alarm_tick 记账。
+ * 毕设版只有液位传感器：收到 0x02 后"先回 0x80，再等 3s 下发"（lora_reply_*）。
  */
 #include <stdint.h>
 #include <stdbool.h>
@@ -26,7 +21,6 @@
 #include "bsp_tim.h"
 #include "config_store.h"
 #include "log.h"
-extern void app_event_device_online(const char *uid_hex, bool online);
 
 /* ==================== 0x01 液位参数载荷(18 字节) ====================
  *  [0-2]  上报间隔 秒(小端 24 位)      [3]    相同液位上报(固定 1)
@@ -111,26 +105,6 @@ bool lora_tx_downlink(uint8_t idx)
         }
     }
     ok = lora_proto_send_frame(&frame);
-
-    /* ==========================================================================
-     * ★★2026-10-08: 声光(0x03)每次【真的发出去】就记一次尝试, 并启动 15 秒窗口★★
-     * --------------------------------------------------------------------------
-     * 为什么记在这里: 这是【唯一的发送咽喉】(lora_downlink_logic 的重发和
-     *   lora_try_send_alarm_idle 的首次发送都走它), 记在这里不会漏也不会重复。
-     * 为什么只在 ok 时记: TX 忙导致的发送失败不算一次尝试 —— 那条指令还在缓存里,
-     *   下一拍会被 lora_try_send_alarm_idle 再捡起来, 不该白扣一次 3 条的配额。
-     * ======================================================================== */
-    if (ok && (s->pending_func == (uint8_t)LORA_FUNC_SET_ALARM))
-    {
-        s->alarm_attempts++;
-        s->alarm_pending = true;
-        s->alarm_tick    = get_tick_ms();
-        s->alarm_gear    = g_alarm_gear_inflight;
-        log_info("[GEAR] -> %02X%02X%02X 发出第 %u/%u 条 0x03(档位 %u), 等 0x82/0x83 %us\r\n",
-                 s->dev_uid[0], s->dev_uid[1], s->dev_uid[2],
-                 (unsigned)s->alarm_attempts, (unsigned)LORA_ALARM_MAX_ATTEMPTS,
-                 (unsigned)s->alarm_gear, (unsigned)(LORA_ALARM_TIMEOUT_MS / 1000u));
-    }
     return ok;
 }
 
@@ -195,19 +169,11 @@ static int lora_try_send_downlink(uint8_t idx)
  *
  * 【重传耗尽 = 丢弃这条指令】—— 这是 2026-09 修掉的一个严重逻辑错误。
  *
- * 老实现耗尽后只把状态改回 IDLE、缓存【留着】, 注释写的是"等设备下次上报再试"。
- * 但声光报警器是【常驻 RX、且从不主动上报】的设备:
- *   lora_try_send_alarm_idle() 每秒扫一遍 IDLE 的报警器, 一看缓存里还有这条指令
- *   → 又发一轮(3 次重传) → 又耗尽 → 状态回 IDLE → 下一秒再发 …
- * 结果就是【网关永远在定时重发同一条 0x03】:
- *   1) 空口被这条帧刷满, 液位传感器的上报被挤掉 / 收到也来不及应答;
- *   2) 每次发送都要阻塞 ~500ms(LORA_TX_SETTLE_MS + 等 TX_DONE), 主循环被反复
- *      按停, 这期间 g4_at_poll() 不跑, 云端下行堆在串口缓冲里溢出丢失;
- *   3) 报警器那边收到的是同一条指令的无限副本。
+ * 老实现耗尽后只把状态改回 IDLE、缓存【留着】, 结果同一条指令会在后续周期里
+ * 被反复重发，既占用空口也会反复阻塞主循环。
  *
- * 正式业务逻辑: 3 次重传都没 ACK = 这次下发失败, 丢掉缓存并明确打日志;
- * 需要再试由云端重新下发(或等液位下次上报搭车 —— 液位缓存也一起丢,
- * 保持"两类设备语义一致", 免得又埋一个"某些设备会偷偷无限重试"的坑)。
+ * 现在的逻辑: 3 次重传都没 ACK = 这次下发失败, 丢掉缓存并明确打日志；
+ * 需要再试由云端重新下发。
  */
 void lora_downlink_logic(void)
 {
@@ -225,53 +191,13 @@ void lora_downlink_logic(void)
          *   冲突, 已作废; 详见 g_unbind 上方注释) */
         if (s->pending_func == LORA_FUNC_UNBIND) continue;
 
-        /* ==========================================================================
-         * ★★2026-10-08: 声光(0x03)走【业务级】的 15 秒 / 3 条逻辑, 不走下面的帧级重传★★
-         * --------------------------------------------------------------------------
-         * 为什么必须分开:
-         *   · 帧级重传(下面那套)语义是"发出去的帧没被解出来 ⇒ 重发同一串字节";
-         *   · 声光的 0x80 只表示"收到了", 真正的结论在 0x82/0x83 ——
-         *     所以"没结果"要重发的是【整条业务动作】, 而 0x80 到了也不能算成功。
-         *   混在一起会出现: 设备回了 0x80 但 10 秒后才回 0x82, 中间被帧级重传
-         *   又发了一遍 ⇒ 平台收到两条 event.action、设备执行两次。
-         * ======================================================================== */
-        if (s->pending_func == (uint8_t)LORA_FUNC_SET_ALARM)
-        {
-            if (!s->alarm_pending) continue;                /* 不在等结果: 还没发/已收尾 */
-            if ((now - s->alarm_tick) < LORA_ALARM_TIMEOUT_MS) continue;
-
-            log_info("[GEAR] !! %02X%02X%02X 等了 %us 没收到 0x82/0x83 -> 本条算失败"
-                     "(已发 %u/%u)\r\n",
-                     s->dev_uid[0], s->dev_uid[1], s->dev_uid[2],
-                     (unsigned)(LORA_ALARM_TIMEOUT_MS / 1000u),
-                     (unsigned)s->alarm_attempts, (unsigned)LORA_ALARM_MAX_ATTEMPTS);
-            lora_alarm_on_fail(s);
-            continue;
-        }
-
         if ((now - s->send_req_tick) < LORA_ACK_TIMEOUT_MS) continue;
 
         s->retry_cnt++;
         if (s->retry_cnt > LORA_MAX_RETRY)
         {
-            /* 重传耗尽: 丢弃下发缓存, 回到 IDLE(不会再被 lora_try_send_alarm_idle 捡起来重发)
-             * ★2026-10-23: 改成条件删除 —— 重传窗口内云端可能已经下发了一条新指令,
-             *   按 uid 无条件删会把那条新的也删掉, 等于静默丢掉云端的最新命令。
-             *   不匹配(= 有更新的)就保留, 状态已回 IDLE, 下一拍会被正常捡起来发。 */
-            if (s->pending_func == (uint8_t)LORA_FUNC_PING_ALARM)
-            {
-                s->is_online = false;
-                log_info("[GW] !! 声光 %02X%02X%02X 0x09 无应答 -> 判离线\r\n",
-                         s->dev_uid[0], s->dev_uid[1], s->dev_uid[2]);
-                if (!s->alarm_offline_reported)
-                {
-                    char uid_hex[CFG_UID_STR_MAX];
-
-                    s->alarm_offline_reported = true;
-                    (void)cfg_uid_from_bytes(s->dev_uid, uid_hex);
-                    app_event_device_online(uid_hex, false);
-                }
-            }
+            /* 重传耗尽: 条件删除下发缓存。重传窗口内云端可能已经下发新指令，
+             * 按 uid 无条件删会把那条新的也删掉；不匹配就保留，下一拍正常发。 */
             s->state     = SLAVE_STATE_IDLE;
             s->retry_cnt = 0U;
             if (!data_cache_down_del_if_match(s->dev_uid, s->pending_func,
@@ -307,41 +233,6 @@ static bool lora_any_slave_waiting_ack(void)
             return true;
     }
     return false;
-}
-
-/**
- * \brief 扫描所有 IDLE 的声光报警器从机, 尝试发送缓存中的待下发指令
- *        声光报警器常驻 RX, 可以随时主动发; 液位传感器休眠, 只能等上报搭车
- *        无线电忙(有从机在等ACK)时跳过, 避免打断接收 ACK
- *
- * \note 这里能捡起来的只可能是【云端刚下发、还没发出去过】的那一条:
- *       一旦发出去进了 WAIT_ACK, 要么收到 ACK 清缓存, 要么重传耗尽被
- *       lora_downlink_logic() 删缓存 —— 两种结局都不会让它再回到这里。
- *       (老版本耗尽后不删缓存, 于是这条函数每秒给它重发一轮, 永不停歇。)
- */
-void lora_try_send_alarm_idle(void)
-{
-    if (lora_any_slave_waiting_ack())
-        return;
-
-    for (uint8_t i = 0U; i < g_slave_count; i++)
-    {
-        if (g_slave_list[i].state == SLAVE_STATE_IDLE &&
-            g_slave_list[i].dev_type == SLAVE_TYPE_ALARM_OUT)
-        {
-            /* ★2026-10-23 P1: 以前这里是无条件 break —— 只要扫到第一台
-             *   "IDLE 的声光报警器" 就停, 不管它到底有没有指令要发。
-             *   于是第 1 台空闲(缓存里没它的事)时, 第 2 台起的待下发指令
-             *   永远轮不到, 表现是"多台声光报警器只联动其中一台"。
-             *   改成"真的发出去了才停"(那里会进 WAIT_ACK, 下个周期发下一台);
-             *   没缓存/载荷坏就继续看下一台。 */
-            if (lora_try_send_downlink(i) == DOWNLINK_SENT)
-            {
-                /* 发了一台就停, 该从机进入 WAIT_ACK, 下次周期再发下一台 */
-                break;
-            }
-        }
-    }
 }
 
 /* ==================== 收到请求帧后的"分两步错开"应答时序 ====================
@@ -629,7 +520,7 @@ static int _sensor_params_commit(const uint8_t uid[CFG_UID_BYTES],
                  "(真正发出前会再取一次)\r\n", src);
     }
 
-    ret = lora_business_send_req(uid, SLAVE_TYPE_SENSOR,
+    ret = lora_business_send_req(uid,
                                  LORA_FUNC_SET_SENSOR_PARAM,
                                  payload, (uint8_t)sizeof(payload));
     if (ret != 0)
@@ -755,80 +646,6 @@ static void _downlink_set_sensor(const lora_frame_t *frame)
 #else
     log_info("[CLOUD->LoRa] 已缓存, 等液位下次上报时随应答下发\r\n");
 #endif
-}
-
-/* ---------- 0x03 云端设置声光报警器: 原样转发 ----------
- *
- * 云端 data 顺序即线上字节顺序, 与设备端完全一致 —— 网关【不解析、不加工】:
- *   power_ctrl 1B | light_ctrl 1B | volume 1B | led_mode 1B | led_brightness 1B |
- *   led_scroll_speed 1B | led_text_len 1B | led_text(len 字节 UTF-8) |
- *   tts_text_len 1B | tts_text(len 字节 UTF-8)
- *
- * ⚠️ 2026-10-28 更正: 这里原写 GB2312。本项目文本一律 UTF-8 原样搬运
- *    (汉字 3 字节), 网关【不做 GB2312 转码】(用户裁决: 代码正确, 保持现状)。
- *    设备侧必须按 UTF-8 解析, 否则屏上是乱码。
- *
- * 报警器常驻 RX, 缓存完立刻发; 无线忙就留在缓存里, 由 poll 里的
- * lora_try_send_alarm_idle() 捡起来发。
- */
-static void _downlink_set_alarm(const lora_frame_t *frame, uint8_t idx)
-{
-    int ret;
-
-    if (frame->data_len == 0U)
-    {
-        _downlink_drop(frame->func, "载荷为空");
-        return;
-    }
-
-    /* 【不在固定从机表里 -> 直接转发】(现场规则: 地址首位是 3 就是声光报警器)
-     *   报警器【常驻接收】, 不必等它上报, 所以直接上发即可 ——
-     *   而且数据【一个字节都不改】: 现场要求"声光报警的数据我们不处理, 只判断"。
-     *   (在表里的走下面那条"缓存 + 立即发 + ACK 重传"的路径, 多一层保障。) */
-    if (idx == 0xFFU)
-    {
-        log_info("[CLOUD->LoRa] 0x03 声光 %02X%02X%02X 不在固定表里 -> 【直接转发】"
-                 "%u 字节(数据不改)\r\n",
-                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
-                 (unsigned)frame->data_len);
-
-        /* 这帧就是从云端解出来的原帧; 组帧是幂等的(字段不变 -> CRC 不变),
-         * 所以重发一次等于把云端那串字节原样送出去。
-         * 去 const 是安全的: 实参是 lora_mqtt_recv_cb 里的非 const 局部变量。 */
-        if (lora_proto_send_frame((lora_frame_t *)frame))
-        {
-            log_info("[CLOUD->LoRa] 直接转发完成\r\n");
-        }
-        else
-        {
-            log_info("[CLOUD->LoRa] !! 直接转发失败(射频没发出去) -> 查 LoRa 供电/天线\r\n");
-        }
-        return;
-    }
-
-    /* 下发缓存每台设备是 payload[211](其中 1 字节给 func), 可用载荷 206 字节
-     * (= LEVEL_GEAR_PAYLOAD_MAX = 空口 data 上限 207 - func 1 字节)。
-     * 声光那条三段文本用满也只有 191 字节, 够用。
-     * ⚠️ 2026-10-28 更正: 这里原写"只有 64 字节 / data 最多 63 字节",
-     *    是 2026-10-08 扩容前的旧口径 —— 按 63 去排查现场问题会找错方向。
-     * ⚠️ 设备侧自己的接收缓存不由网关负责(用户 2026-10-28 明确: 从机缓存一定够),
-     *    网关只需保证自己这一侧不误判"超长"。 */
-    ret = lora_business_send_req(frame->dev_uid, SLAVE_TYPE_ALARM_OUT,
-                                 LORA_FUNC_SET_ALARM, frame->data, frame->data_len);
-    if (ret != 0)
-    {
-        _downlink_drop(frame->func, "投递失败(载荷>206字节或缓存满)");
-        return;
-    }
-
-    log_info("[CLOUD->LoRa] 0x03 声光 %02X%02X%02X %u 字节已缓存\r\n",
-             frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
-             (unsigned)frame->data_len);
-
-    if (!lora_any_slave_waiting_ack())
-    {
-        (void)lora_try_send_downlink(idx);
-    }
 }
 
 /* ---------- MQTT 下行回调(由 lora_business_init 注册给 g4_urc) ----------
@@ -984,12 +801,10 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
     (void)lora_hex_str2bin;
     (void)_downlink_drop;
     (void)_downlink_set_sensor;
-    (void)_downlink_set_alarm;
     return;
 #else
     lora_frame_t frame;
     int          n;
-    uint8_t      idx;
 
     /* ---- 1. 取出原始帧字节 ---- */
     if ((data == NULL) || (len < LORA_FRAME_OVERHEAD))
@@ -1032,20 +847,6 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
         return;
     }
 
-    /* 【设备类型按"地址首位"判断, 不再只认固定从机表】(现场规则)
-     *   1xxxxx 网关 / 2xxxxx 液位传感器 / 3xxxxx 声光报警器
-     * 固定表还是要查 —— 在表里就能享受"在线跟踪 + ACK 重传"那套有状态的处理;
-     * 不在表里【也不代表这帧没用】: 只要地址首位是认得的类型, 后面按类型分发,
-     * 声光报警器会走"直接转发"分支(见 _downlink_set_alarm)。
-     * (老代码在这里直接 return 丢弃 —— 那样一台没登记的报警器就永远收不到指令。) */
-    idx = lora_slave_find(frame.dev_uid);
-    if (idx == 0xFFU)
-    {
-        log_info("[GW] 从机 %02X%02X%02X 不在固定表里, 按【地址首位=%u】判断设备类型\r\n",
-                 frame.dev_uid[0], frame.dev_uid[1], frame.dev_uid[2],
-                 (unsigned)lora_dev_type_of_uid(frame.dev_uid));
-    }
-
     /* 帧里的"网关设备地址"应该是本机。不是也照样转发(要不要拦是策略问题),
      * 但必须打出来 —— 否则云端把网关号填错会一直没人发现。 */
     if (memcmp(frame.gw_uid, g_gw_uid, CFG_UID_BYTES) != 0)
@@ -1058,6 +859,20 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
     log_info("[CLOUD->LoRa] 收到 %d 字节帧: dev=%02X%02X%02X func=0x%02X dlen=%u\r\n",
              n, frame.dev_uid[0], frame.dev_uid[1], frame.dev_uid[2],
              (unsigned)frame.func, (unsigned)frame.data_len);
+
+    /* 毕设版只有液位传感器：非液位 UID 以及旧联动功能码一并拒绝。
+     * 即使 LORA_DOWNLINK_PASSTHROUGH=1，也不能把声光帧透传到空口。 */
+    if (lora_addr_type(frame.dev_uid) != LORA_DEV_TYPE_LEVEL_SENSOR)
+    {
+        _downlink_drop(frame.func, "非液位设备 UID，拒绝");
+        return;
+    }
+    if ((frame.func == 0x03U) || (frame.func == 0x09U) ||
+        (frame.func == 0x82U) || (frame.func == 0x83U))
+    {
+        _downlink_drop(frame.func, "旧联动功能码，拒绝");
+        return;
+    }
 
 #if LORA_DOWNLINK_RAW_FORWARD
     /* ---------------- 粗略直转(台架联调) ----------------
@@ -1072,11 +887,9 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
      *        这几百毫秒主循环是停住的。它跑在 g4_urc_poll()(收包泵之外), 所以不会
      *        丢 4G 接收, 但下行连发时会把投递排到后面。台架联调可接受。
      * 想回到"带业务解释"的老路径: 把 LORA_DOWNLINK_RAW_FORWARD 改成 0。 */
-    (void)idx;
     /* 老的业务解释路径仍在编译单元里(把 LORA_DOWNLINK_RAW_FORWARD 改成 0 即可切回),
      * 这里显式引用一下, 免得编译器报"定义未使用"。 */
     (void)_downlink_set_sensor;
-    (void)_downlink_set_alarm;
     log_info("[CLOUD->LoRa] 直转 %d 字节原始帧到空口: dev=%02X%02X%02X func=0x%02X dlen=%u\r\n",
              n, frame.dev_uid[0], frame.dev_uid[1], frame.dev_uid[2],
              (unsigned)frame.func, (unsigned)frame.data_len);
@@ -1103,17 +916,6 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
         _downlink_set_sensor(&frame);
         break;
 
-    case LORA_FUNC_SET_ALARM:                   /* 0x03 设置声光报警器 */
-        /* 类型判断改看【地址首位】: 3xxxxx = 声光报警器
-         * 声光的数据【网关不处理, 只判断】—— 认出类型后原样转发。 */
-        if (lora_dev_type_of_uid(frame.dev_uid) != LORA_UID_TYPE_ALARM)
-        {
-            _downlink_drop(frame.func, "设备地址首位不是 3 -> 不是声光报警器");
-            break;
-        }
-        _downlink_set_alarm(&frame, idx);
-        break;
-
     case LORA_FUNC_RESP_OK:                     /* 0x80 云端对上行上报的应答 */
     case LORA_FUNC_RESP_ERR:                    /* 0x81 */
         log_info("[CLOUD->LoRa] 云端应答 0x%02X(%s), 无需处理\r\n",
@@ -1122,7 +924,7 @@ void lora_mqtt_recv_cb(const char *topic, const uint8_t *data, uint16_t len)
         break;
 
     default:
-        _downlink_drop(frame.func, "功能码不支持(下行只认 0x01/0x03)");
+        _downlink_drop(frame.func, "功能码不支持(下行只认 0x01)");
         break;
     }
 #endif /* LORA_DOWNLINK_RAW_FORWARD */
@@ -1156,7 +958,7 @@ bool lora_business_send_ack(const uint8_t gw_uid[CFG_UID_BYTES], const uint8_t d
     return lora_proto_send_frame(&frame);
 }
 
-int lora_business_send_req(const uint8_t uid[CFG_UID_BYTES], slave_type_t dev_type,
+int lora_business_send_req(const uint8_t uid[CFG_UID_BYTES],
                            uint8_t func, const uint8_t *data, uint8_t data_len)
 {
     uint8_t idx;
@@ -1174,17 +976,6 @@ int lora_business_send_req(const uint8_t uid[CFG_UID_BYTES], slave_type_t dev_ty
         if (idx == 0xFFU) return -2;
     }
 
-    /* 表里的 dev_type 在绑定时确定, 运行期不变。调用方传进来的如果和表不一致,
-     * 以表为准并告警(避免一个地址被当成两种设备) */
-    if (g_slave_list[idx].dev_type != dev_type)
-    {
-        log_info("[GW] !! %02X%02X%02X 在从机表里是 %s, 调用方却按 %s 下发, 以表为准\r\n",
-                 uid[0], uid[1], uid[2],
-                 (g_slave_list[idx].dev_type == SLAVE_TYPE_SENSOR) ? "SENSOR" : "ALARM_OUT",
-                 (dev_type == SLAVE_TYPE_SENSOR) ? "SENSOR" : "ALARM_OUT");
-        dev_type = g_slave_list[idx].dev_type;
-    }
-
     /* 把 func 塞进 payload[0], data 接在后面 —— 这样 data_cache_down_push
      * 只需要存一段连续字节流, fetch 时取出来直接当 frame.data[] */
     uint8_t payload[LORA_FRAME_DATA_MAX];
@@ -1194,20 +985,9 @@ int lora_business_send_req(const uint8_t uid[CFG_UID_BYTES], slave_type_t dev_ty
         memcpy(&payload[1], data, data_len);
     }
 
-    int ret = data_cache_down_push(uid, dev_type, payload, (uint8_t)(data_len + 1U));
+    int ret = data_cache_down_push(uid, payload, (uint8_t)(data_len + 1U));
     if (ret != 0) return -3;
 
-    /* ★2026-11-02 (G1): 新动作进缓存后, 立刻把该设备上一条在途的 0x03 作废★
-     * 必须在 push 成功【之后】: 抢占只是放弃"旧动作的等待与配额", 不清缓存,
-     * 下一个 poll 要发的是刚刚写进去的这条新动作。
-     * 只对 0x03 生效 —— 0x05 解绑锁、0x09 探活各有各的状态机, 不能抢。 */
-    if (func == (uint8_t)LORA_FUNC_SET_ALARM)
-    {
-        lora_alarm_supersede(&g_slave_list[idx]);
-    }
-
-    /* 实际发送时机:
-     *   声光报警器(常驻 RX) -> _downlink_set_alarm 里立即 lora_try_send_downlink
-     *   液位传感器(休眠)   -> 等它上报时 lora_reply_logic 第二步搭车下发 */
+    /* 液位传感器是休眠设备：等它上报时由 lora_reply_logic 第二步搭车下发。 */
     return 0;
 }

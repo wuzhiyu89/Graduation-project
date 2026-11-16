@@ -3,7 +3,7 @@
  * @brief 设备绑定（LoRa 0x04）：窗口状态机 + 握手 + 落配置
  *
  * 时序（用户 2026-09-29 决策）：
- *   云端 dev.bind -> lora_business_open_bind_window() 开窗口（BIND_LISTENING）
+ *   云端 sen.bind -> lora_business_open_bind_window() 开窗口（BIND_LISTENING）
  *   设备发 0x04   -> 网关回 0x80、转 BIND_WAIT_DEV_ACK
  *   设备回 0x80   -> 写 config_store + 从机表、上报 event.device{bound}
  *   窗口到期      -> 没走完就上报 bind_failed
@@ -28,7 +28,7 @@
  * 【为什么绑定只在云端开窗口时才监听 0x04】(用户 2026-09-29 决策):
  *   平时 0x04 是个"陌生设备广播" —— 任何附近设备都可能发, 网关常驻监听就
  *   会被无关帧打扰并回 ACK(空口被刷)。所以常态是 BIND_IDLE, 只有当云端
- *   下发 dev.bind{serial,name,pairWindowSeconds}、经 pair_hook 调
+ *   下发 sen.bind{serial,name,pairWindowSeconds}、经 pair_hook 调
  *   lora_business_open_bind_window() 时才进入 BIND_LISTENING 打开窗口,
  *   到点自动回 IDLE。
  *
@@ -54,11 +54,8 @@ static struct
     bind_state_t state;
     uint32_t     deadline_tick;      /* 窗口到期 tick(进入 LISTENING 时设定) */
     uint32_t     last_ack_tx_tick;   /* 上次向设备发 0x80 ACK 的 tick */
-    char         expected_serial[CFG_SERIAL_MAX + 1U];   /* 落盘用, 来自云端 dev.bind */
+    char         expected_serial[CFG_SERIAL_MAX + 1U];   /* 落盘用, 来自云端 sen.bind */
     char         expected_name[CFG_NAME_MAX + 1U];
-    bool         is_sensor;          /* sen.bind=true 液位 / dev.bind=false 声光 */
-    uint8_t      dev_type;           /* ★ 第 11 条: dev.bind 给的联动设备类型
-                                      * (cfg_dev_type_t: 1 液位 / 3 一体机); sen.bind 时无意义 */
     uint8_t      pending_uid[CFG_UID_BYTES];     /* 发起绑定的设备地址(收到 0x04 后登记) */
 } g_bind;
 _Static_assert(sizeof(g_bind.pending_uid) == CFG_UID_BYTES,
@@ -85,21 +82,20 @@ static lora_bind_event_fn g_bind_event_cb = NULL;
 /* 统一的事件出口。uid_hex 必须是 26 位(13 字节)大写 hex 串, 或 NULL 表示"无具体设备"(如超时)
  * ⚠️ 2026-10-28 更正: 这里原写"6 字符", 是 3 字节 UID 时代的旧口径;
  *    现在 UID 固定 13 字节 / 26 位 hex, 传 6 字符会静默匹配不上任何设备。 */
-void lora_bind_fire_event(const char *uid_hex, bool is_sensor, lora_bind_event_t event)
+void lora_bind_fire_event(const char *uid_hex, lora_bind_event_t event)
 {
     const char *ev_str =
         (event == LORA_BIND_EVENT_BOUND)       ? "bound"       :
         (event == LORA_BIND_EVENT_BIND_FAILED) ? "bind_failed" :
         (event == LORA_BIND_EVENT_UNBOUND)     ? "unbound"     : "unknown";
 
-    log_info("[BIND] event=%s uid=%s type=%s\r\n",
+    log_info("[BIND] event=%s uid=%s type=sensor\r\n",
              ev_str,
-             (uid_hex != NULL) ? uid_hex : "(none)",
-             is_sensor ? "sensor" : "device");
+             (uid_hex != NULL) ? uid_hex : "(none)");
 
     if (g_bind_event_cb != NULL)
     {
-        g_bind_event_cb(uid_hex, is_sensor, event);
+        g_bind_event_cb(uid_hex, event);
     }
 }
 
@@ -116,37 +112,22 @@ void lora_bind_send_ack_to_pending(void)
 /* 收到 0x04 绑定请求: 检查容量 → 登记 pending_uid → 立即回 0x80 */
 void lora_bind_handle_0x04(const lora_frame_t *frame)
 {
-    /* ★2026-10-27: UID 首字节必须与窗口类型一致★
-     *
-     * 0x04 帧本身【不带设备类型】, 网关只能靠开窗命令区分液位/声光。以前
-     * 本地 `#bind` 默认按液位开窗, 声光会被写进 sensors[]; 绑定成功后
-     * lora_bind_queue_sensor_sync() 立刻排队 0x01(含 6 字节校时) ->
-     * 现场就是"声光绑定后被校时"。
-     *
-     * 这里按 UID 首字节兜底: 液位窗口只收 21 开头, 声光窗口只收 31 开头;
-     * 不匹配就回 0x81 拒绝, 窗口保持打开(可以继续等正确的设备)。
-     */
+    /* 0x04 帧本身不带设备类型；毕设版只接受液位 UID（首字节 0x21）。 */
+    if (lora_addr_type(frame->dev_uid) != LORA_DEV_TYPE_LEVEL_SENSOR)
     {
-        uint8_t expect = g_bind.is_sensor ? 0x21U : 0x31U;
-
-        if (frame->dev_uid[0] != expect)
-        {
-            log_info("[BIND] !! %02X%02X%02X 的 UID 首字节 0x%02X 与窗口类型(%s)不符 -> 回 0x81 拒绝\r\n",
-                     frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
-                     (unsigned)frame->dev_uid[0],
-                     g_bind.is_sensor ? "液位/21" : "声光/31");
-            (void)lora_business_send_ack(g_gw_uid, frame->dev_uid,
-                                         LORA_FUNC_BIND_REQ, false, 0x07U); /* 0x07 = 类型不符 */
-            return;
-        }
+        log_info("[BIND] !! %02X%02X%02X 的 UID 首字节 0x%02X 不是液位类型 -> 回 0x81 拒绝\r\n",
+                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
+                 (unsigned)frame->dev_uid[0]);
+        (void)lora_business_send_ack(g_gw_uid, frame->dev_uid,
+                                     LORA_FUNC_BIND_REQ, false, 0x07U); /* 0x07 = 类型不符 */
+        return;
     }
 
-    /* 容量检查(总数≤5 / 液位≤4 / 声光≤3) —— 不够直接回 0x81, 不进入握手 */
-    if (!config_store_can_add(g_bind.is_sensor))
+    /* 容量检查 —— 不够直接回 0x81, 不进入握手 */
+    if (!config_store_can_add(true))
     {
-        log_info("[BIND] !! %02X%02X%02X 请求绑定, 但%s已达上限, 回 0x81 拒绝\r\n",
-                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2],
-                 g_bind.is_sensor ? "液位传感器" : "声光设备");
+        log_info("[BIND] !! %02X%02X%02X 请求绑定, 但液位传感器已达上限, 回 0x81 拒绝\r\n",
+                 frame->dev_uid[0], frame->dev_uid[1], frame->dev_uid[2]);
         (void)lora_business_send_ack(g_gw_uid, frame->dev_uid,
                                      LORA_FUNC_BIND_REQ, false, 0x06U);  /* err 0x06 = 容量满 */
         return;
@@ -166,9 +147,8 @@ void lora_bind_handle_0x04(const lora_frame_t *frame)
     /* 登记 pending_uid → 转入 WAIT_DEV_ACK → 立即发 0x80 */
     memcpy(g_bind.pending_uid, frame->dev_uid, CFG_UID_BYTES);
     g_bind.state = BIND_WAIT_DEV_ACK;
-    log_info("[BIND] 收到 %02X%02X%02X 的 0x04 绑定请求(type=%s), 进入 WAIT_DEV_ACK\r\n",
-             g_bind.pending_uid[0], g_bind.pending_uid[1], g_bind.pending_uid[2],
-             g_bind.is_sensor ? "sensor" : "device");
+    log_info("[BIND] 收到 %02X%02X%02X 的 0x04 绑定请求(type=sensor), 进入 WAIT_DEV_ACK\r\n",
+             g_bind.pending_uid[0], g_bind.pending_uid[1], g_bind.pending_uid[2]);
     lora_bind_send_ack_to_pending();
 }
 
@@ -242,13 +222,11 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
     (void)cfg_uid_from_bytes(g_bind.pending_uid, uid_hex);
 
     /* ★2026-10-27: 绑定前残留的下发缓存一律作废★
-     * 新绑定不继承旧指令 —— 尤其是"曾被误绑成液位"时排下的 0x01(带校时),
-     * 否则重绑成声光后它还会被当成待发指令发出去。 */
+     * 新绑定不继承旧指令 —— 重绑时旧 UID 排下的 0x01 不应发给新设备。 */
     (void)data_cache_down_del_by_uid(g_bind.pending_uid);
 
     /* 2) 追加到运行期从机表(失败就别写 config_store, 免得两边不一致) */
-    slave_type_t type = g_bind.is_sensor ? SLAVE_TYPE_SENSOR : SLAVE_TYPE_ALARM_OUT;
-    int idx = lora_slave_add(g_bind.pending_uid, type);
+    int idx = lora_slave_add(g_bind.pending_uid);
     if (idx < 0)
     {
         /* ==================================================================
@@ -286,15 +264,14 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
         {
             cfg_result_t rb;
 
-            log_info("[BIND] %s %s 重新绑定(已在从机表, 不新增): serial=%s name=%s\r\n",
-                     g_bind.is_sensor ? "液位传感器" : "声光设备",
+            log_info("[BIND] 液位传感器 %s 重新绑定(已在从机表, 不新增): serial=%s name=%s\r\n",
                      uid_hex,
                      g_bind.expected_serial[0] ? g_bind.expected_serial : "(none)",
                      g_bind.expected_name[0]    ? g_bind.expected_name    : "(none)");
 
             /* ① 覆盖 serial/name(设备侧连 type 一起更新; 运行参数一律不动) */
             rb = config_store_rebind_device(uid_hex, g_bind.expected_serial,
-                                            g_bind.expected_name, g_bind.dev_type,
+                                            g_bind.expected_name, 0U,
                                             cloud_proto_get_now_ts());
             if (rb != CFG_OK)
             {
@@ -307,12 +284,9 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
             (void)last_value_clear_uid(g_bind.pending_uid);
 
             /* ④ 新设备必须拿到当前参数: 排一条 0x01, 首次上报时随应答下发 */
-            if (g_bind.is_sensor)
-            {
-                lora_bind_queue_sensor_sync(uid_hex);
-            }
+            lora_bind_queue_sensor_sync(uid_hex);
 
-            lora_bind_fire_event(uid_hex, g_bind.is_sensor, LORA_BIND_EVENT_BOUND);
+            lora_bind_fire_event(uid_hex,LORA_BIND_EVENT_BOUND);
             g_bind.state = BIND_IDLE;
             return;
         }
@@ -320,7 +294,7 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
         /* 到这里就是真失败: 从机表【满了】 */
         log_info("[BIND] !! 从机表【已满】, 无法绑定 %s(idx=%d) —— 请先解绑不用的设备\r\n",
                  uid_hex, idx);
-        lora_bind_fire_event(uid_hex, g_bind.is_sensor, LORA_BIND_EVENT_BIND_FAILED);
+        lora_bind_fire_event(uid_hex,LORA_BIND_EVENT_BIND_FAILED);
         g_bind.state = BIND_IDLE;
         return;
     }
@@ -334,8 +308,7 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
      * (2026-09-29 评审修正) */
     uint32_t     now_ts = cloud_proto_get_now_ts();
     cfg_result_t wr     = config_store_bind_device(uid_hex, g_bind.expected_serial,
-                                                   g_bind.expected_name, g_bind.is_sensor,
-                                                   g_bind.dev_type, now_ts);
+                                                   g_bind.expected_name, true, 0U, now_ts);
 
     if (wr == CFG_ERR_RANGE)
     {
@@ -353,14 +326,14 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
          * 只覆盖 serial/name(运行参数一律不动), 运行期表保留。 */
         log_info("[BIND] %s 已在配置里(平台先下发过) -> 走重绑, 不新增条目\r\n", uid_hex);
         wr = config_store_rebind_device(uid_hex, g_bind.expected_serial,
-                                        g_bind.expected_name, g_bind.dev_type, now_ts);
+                                        g_bind.expected_name, 0U, now_ts);
     }
 
     if (wr != CFG_OK)
     {
         log_info("[BIND] !! 写 config_store 失败(code=%d), 回滚运行期表\r\n", (int)wr);
         (void)lora_slave_del(g_bind.pending_uid);
-        lora_bind_fire_event(uid_hex, g_bind.is_sensor, LORA_BIND_EVENT_BIND_FAILED);
+        lora_bind_fire_event(uid_hex,LORA_BIND_EVENT_BIND_FAILED);
         g_bind.state = BIND_IDLE;
         return;
     }
@@ -370,17 +343,13 @@ void lora_bind_handle_dev_ack(const lora_frame_t *frame)
 
     /* 4) 绑定成功 */
     /* 给液位排一条 0x01 配置同步 —— 修"绑完第一包不带配置" */
-    if (g_bind.is_sensor)
-    {
-        lora_bind_queue_sensor_sync(uid_hex);
-    }
+    lora_bind_queue_sensor_sync(uid_hex);
 
-    log_info("[BIND] %s %s 绑定成功(uid=%s, serial=%s, name=%s), 已写 config_store + 从机表\r\n",
-             g_bind.is_sensor ? "液位传感器" : "声光设备",
+    log_info("[BIND] 液位传感器 %s 绑定成功(uid=%s, serial=%s, name=%s), 已写 config_store + 从机表\r\n",
              uid_hex, uid_hex,
              g_bind.expected_serial[0] ? g_bind.expected_serial : "(none)",
              g_bind.expected_name[0]    ? g_bind.expected_name    : "(none)");
-    lora_bind_fire_event(uid_hex, g_bind.is_sensor, LORA_BIND_EVENT_BOUND);
+    lora_bind_fire_event(uid_hex,LORA_BIND_EVENT_BOUND);
 
     g_bind.state = BIND_IDLE;
     memset(g_bind.pending_uid, 0, sizeof(g_bind.pending_uid));
@@ -417,14 +386,14 @@ void lora_bind_logic(void)
         char uid_hex[CFG_UID_STR_MAX];
         /* cfg_uid_from_bytes 不会失败, 直接走失败回调 */
         (void)cfg_uid_from_bytes(g_bind.pending_uid, uid_hex);
-        lora_bind_fire_event(uid_hex, g_bind.is_sensor, LORA_BIND_EVENT_BIND_FAILED);
+        lora_bind_fire_event(uid_hex,LORA_BIND_EVENT_BIND_FAILED);
         log_info("[BIND] 窗口到期, 未收到 %02X%02X%02X 的确认, 绑定失败\r\n",
                  g_bind.pending_uid[0], g_bind.pending_uid[1], g_bind.pending_uid[2]);
     }
     else
     {
         log_info("[BIND] 窗口到期, 期间没有设备发起 0x04, 绑定失败(无具体设备)\r\n");
-        lora_bind_fire_event(NULL, g_bind.is_sensor, LORA_BIND_EVENT_BIND_FAILED);
+        lora_bind_fire_event(NULL,LORA_BIND_EVENT_BIND_FAILED);
     }
 
     g_bind.state = BIND_IDLE;
@@ -438,8 +407,7 @@ void lora_business_set_bind_event_cb(lora_bind_event_fn fn)
 }
 
 bool lora_business_open_bind_window(const char *serial, const char *name,
-                                     uint16_t window_s, bool is_sensor,
-                                     uint8_t dev_type)
+                                     uint16_t window_s)
 {
     /* 参数校验: 允许 serial/name 为空(用 "" 落盘), 但 window_s 必须在合理区间 */
     if (window_s == 0U || window_s > 300U) return false;
@@ -465,16 +433,13 @@ bool lora_business_open_bind_window(const char *serial, const char *name,
         g_bind.expected_name[0] = '\0';
     }
 
-    g_bind.is_sensor       = is_sensor;
-    g_bind.dev_type        = dev_type;      /* 第 11 条: dev.bind 的类型, 绑定时写进 devices[].type */
     g_bind.deadline_tick   = get_tick_ms() + (uint32_t)window_s * 1000U;
     g_bind.last_ack_tx_tick = 0U;
     memset(g_bind.pending_uid, 0, sizeof(g_bind.pending_uid));
     g_bind.state           = BIND_LISTENING;
 
-    log_info("[BIND] 开放绑定窗口: window=%us, type=%s, serial=%s, name=%s\r\n",
+    log_info("[BIND] 开放绑定窗口: window=%us, type=sensor, serial=%s, name=%s\r\n",
              (unsigned)window_s,
-             is_sensor ? "sensor" : "device",
              g_bind.expected_serial[0] ? g_bind.expected_serial : "(none)",
              g_bind.expected_name[0]    ? g_bind.expected_name    : "(none)");
     return true;

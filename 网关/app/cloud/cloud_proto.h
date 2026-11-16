@@ -159,8 +159,7 @@ typedef struct
     uint8_t     current_gear;
     uint8_t     sensors_online;
     uint8_t     sensors_total;
-    uint8_t     devices_online;
-    uint8_t     devices_total;
+    /* 毕设版: devices_online/devices_total 已随一体机删除 */
 } cloud_status_t;
 /**
  * @brief 生成 status.report 的 data 段 JSON 对象
@@ -506,28 +505,20 @@ void cloud_proto_set_status_provider(cloud_status_fn fn);
 typedef bool (*cloud_time_sync_fn)(uint32_t unix_ts);
 void cloud_proto_set_time_sync_hook(cloud_time_sync_fn fn);
 
-/* ==================== sen.bind / dev.bind 的配对后端钩子 ==================== */
+/* ==================== sen.bind 的配对后端钩子 ==================== */
 
 /**
  * @brief 打开 LoRa 配对窗口(由 app / LoRa 层提供)
  * @param serial     待绑定设备的序列号(8~16 字节, 已校验)
- * @param name       平台给的名称(可为空串; 已校验长度) —— 配对成功写 sensors[]/devices[] 时用
+ * @param name       平台给的名称(可为空串; 已校验长度) —— 配对成功写 sensors[] 时用
  * @param window_s   窗口秒数
- * @param is_sensor  true = 液位传感器(写入 sensors[]), false = 联动设备(写入 devices[])
  * @return true = 窗口已开
  *
- * @note  【为什么是钩子】开配对窗口要经 LoRa 下发/监听, 属用户正在排障的链路。
- *        把命令的【全部可判逻辑】(参数校验 8~16 字节 / 容量上限 1009 / 窗口秒数)
- *        留在协议层做完并测好, 只在 main.c 注册一行 —— LoRa 侧稳了再接。
- *        ★ 没注册时 sen.bind / dev.bind 明确回 1006 ★
+ * @note  ★ 没注册时 sen.bind 明确回 1006 ★
  *          —— 绝不"假装窗口已开"(平台会一直等 event.device{bound}, 永远等不到)。
  */
-/* ★ 第 11 条(2026-09-30): 多一个 dev_type —— dev.bind 的 type(1 液位/3 一体, 见 config_store.h)
- *   必须一路传到"写 config_store 的那一刻", 否则 devices[].type 只能硬编码,
- *   而该字段文档标"只读", 平台改不了、只能解绑重绑。sen.bind 时该参数无意义(传 0)。 */
 typedef bool (*cloud_pair_open_fn)(const char *serial, const char *name,
-                                   uint16_t window_s, bool is_sensor,
-                                   uint8_t dev_type);
+                                   uint16_t window_s);
 void cloud_proto_set_pair_hook(cloud_pair_open_fn fn);
 
 /** 命令名是否在 21 条命令表内 */

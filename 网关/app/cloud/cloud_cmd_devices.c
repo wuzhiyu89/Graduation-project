@@ -1,13 +1,10 @@
 /**
  * @file  cloud_cmd_devices.c
- * @brief 传感器 / 联动设备类命令（文档 5.3 / 5.4）
+ * @brief 传感器类命令（文档 5.3）
  *
  *   sen.bind / sen.unbind / sen.set / sen.query   —— 液位传感器
- *   dev.bind / dev.unbind / dev.set / dev.query    —— 声光等联动设备
- *   dev.ctrl                                       —— 手动控制（进 manual 模式）
  *
- * 两族共用同一套辅助函数（字段解析、set_entry、last-value 注入、配对钩子），
- * 所以放在同一个文件里，避免再把它们拆成跨文件接口。
+ * 毕设版只有液位传感器；dev.* 联动设备命令与 dev.ctrl 已随一体机删除。
  */
 #include <string.h>
 
@@ -16,7 +13,6 @@
 #include "cloud_json.h"
 #include "config_store.h"
 #include "last_value.h"
-#include "level_supervisor.h"
 #include "sensor_offline.h"
 #include "bsp_tim.h"   /* get_tick_ms */
 #include "log.h"
@@ -84,11 +80,6 @@ static int cloud_cmd_unbind(const cloud_req_t *req, cJSON *data, bool is_sensor)
 int cloud_cmd_sen_unbind(const cloud_req_t *req, cJSON *data)
 {
     return cloud_cmd_unbind(req, data, true);
-}
-
-int cloud_cmd_dev_unbind(const cloud_req_t *req, cJSON *data)
-{
-    return cloud_cmd_unbind(req, data, false);
 }
 
 
@@ -199,20 +190,11 @@ static int cloud_cmd_set_entry(const cloud_req_t *req, cJSON *data, bool is_sens
 
     (void)memcpy(&cloud_cfg_staging_buf, config_store_get(), sizeof(cloud_cfg_staging_buf));
 
-    if (is_sensor)
+    for (i = 0u; i < cloud_cfg_staging_buf.sensor_count; i++)
     {
-        for (i = 0u; i < cloud_cfg_staging_buf.sensor_count; i++)
-        {
-            if (strcmp(cloud_cfg_staging_buf.sensors[i].uid, uid) == 0) { idx = (int)i; break; }
-        }
+        if (strcmp(cloud_cfg_staging_buf.sensors[i].uid, uid) == 0) { idx = (int)i; break; }
     }
-    else
-    {
-        for (i = 0u; i < cloud_cfg_staging_buf.device_count; i++)
-        {
-            if (strcmp(cloud_cfg_staging_buf.devices[i].uid, uid) == 0) { idx = (int)i; break; }
-        }
-    }
+    (void)is_sensor;    /* 毕设只有液位；保留形参仅为减少调用点改动 */
 
     if (idx < 0)
     {
@@ -295,38 +277,6 @@ static int cloud_cmd_set_entry(const cloud_req_t *req, cJSON *data, bool is_sens
         if (cloud_field_given(req->data, "enabled"))
         {
             s->enabled = cj_get_bool(req->data, "enabled", true) ? 1u : 0u;
-        }
-    }
-    else
-    {
-        cfg_device_t *d = &cloud_cfg_staging_buf.devices[idx];
-
-        if (cloud_field_given(req->data, "name") &&
-            !cloud_take_str_field(req->data, "name", d->name, (uint16_t)sizeof(d->name)))
-        {
-            return CLOUD_EC_PARAM;
-        }
-        /* serial / type 都是【只读】字段(文档 3.6): serial 绑定时录入, type 由 dev.bind
-         * 的 type 参数决定。给了就明确拒绝, 不静默忽略。 */
-        if (cloud_field_given(req->data, "serial") || cloud_field_given(req->data, "type"))
-        {
-            return CLOUD_EC_PARAM;
-        }
-        if (cloud_field_given(req->data, "volume"))
-        {
-            uint32_t v = cj_get_uint(req->data, "volume", 0u);
-            if (v > 0xFFu) { return CLOUD_EC_PARAM; }
-            d->volume = (uint8_t)v;
-        }
-        if (cloud_field_given(req->data, "flashMode"))
-        {
-            uint32_t v = cj_get_uint(req->data, "flashMode", 0u);
-            if (v > 0xFFu) { return CLOUD_EC_PARAM; }
-            d->flash_mode = (uint8_t)v;
-        }
-        if (cloud_field_given(req->data, "enabled"))
-        {
-            d->enabled = cj_get_bool(req->data, "enabled", true) ? 1u : 0u;
         }
     }
 
@@ -485,17 +435,6 @@ int cloud_cmd_sen_set(const cloud_req_t *req, cJSON *data)
     return cloud_cmd_set_entry(req, data, true);
 }
 
-int cloud_cmd_dev_set(const cloud_req_t *req, cJSON *data)
-{
-    int rc = cloud_cmd_check_readonly(req->data);
-
-    if (rc != CLOUD_EC_OK)
-    {
-        return rc;
-    }
-    return cloud_cmd_set_entry(req, data, false);
-}
-
 
 /* ==================================================================
  * sen.query —— 文档 5.3 第 10 条 / dev.query —— 文档 5.4 第 15 条
@@ -599,7 +538,7 @@ int cloud_cmd_sen_query(const cloud_req_t *req, cJSON *data)
 {
     static const char *const drop[] =
     {
-        "system", "network", "devices", "thresholds", "gears", "rules", "ota", "meta"
+        "system", "network", "thresholds", "ota", "meta"
     };
     uint8_t i;
 
@@ -618,33 +557,6 @@ int cloud_cmd_sen_query(const cloud_req_t *req, cJSON *data)
     cloud_inject_last_values(cJSON_GetObjectItemCaseSensitive(data, "sensors"), true);
     return CLOUD_EC_OK;
 }
-
-int cloud_cmd_dev_query(const cloud_req_t *req, cJSON *data)
-{
-    static const char *const drop[] =
-    {
-        "system", "network", "sensors", "thresholds", "gears", "rules", "ota", "meta"
-    };
-    uint8_t i;
-
-    (void)req;                          /* 文档这条没有参数 */
-
-    if (!config_store_write_members(data, config_store_get()))
-    {
-        return CLOUD_EC_INTERNAL;
-    }
-
-    for (i = 0u; i < (uint8_t)(sizeof(drop) / sizeof(drop[0])); i++)
-    {
-        cJSON_DeleteItemFromObject(data, drop[i]);
-    }
-
-    /* 联动设备没有水位, 所以不补 levelCm; 电量/时间照补 */
-    cloud_inject_last_values(cJSON_GetObjectItemCaseSensitive(data, "devices"), false);
-    return CLOUD_EC_OK;
-}
-
-
 
 
 
@@ -668,12 +580,11 @@ void cloud_proto_set_pair_hook(cloud_pair_open_fn fn)
     s_pair_fn = fn;
 }
 
-static int cloud_cmd_bind(const cloud_req_t *req, cJSON *data, bool is_sensor)
+static int cloud_cmd_bind(const cloud_req_t *req, cJSON *data)
 {
     char     serial[CFG_SERIAL_MAX + 1u];
     char     name[CFG_NAME_MAX + 1u];
     uint32_t window_s = 60u;            /* 文档默认 60 */
-    uint8_t  dev_type = 0u;             /* dev.bind 的类型(1 液位 / 3 一体机); sen.bind 不用 */
 
     if (req->data == NULL)
     {
@@ -721,57 +632,23 @@ static int cloud_cmd_bind(const cloud_req_t *req, cJSON *data, bool is_sensor)
         }
     }
 
-    /* ---- 第 11 条: dev.bind 的 type(文档 5.4 第 11 条, 额外必填) ----
-     * ★2026-11-03 统一口径★ 云端 dev.bind 只下发 1 和 3:
-     *     1 = 液位传感器(UID 21)  -> 按液位开窗(等价 sen.bind)
-     *     3 = 一体机/声光(UID 31) -> 按联动设备开窗
-     *   其它值(含 2)一律 1001。旧注释里的"1 声光 / 2 LED"作废。
-     * 【为什么不猜】type 写错会让绑定进错表(液位进 devices[]), 平台自己改不了,
-     *   只能解绑重绑, 现场很折腾。 */
-    if (!is_sensor)
-    {
-        uint32_t t;
-
-        if (cj_get(req->data, "type", NULL, 0u) != CJ_NUM)
-        {
-            return CLOUD_EC_PARAM;          /* 缺 type */
-        }
-        t = cj_get_uint(req->data, "type", 0u);
-        if (t == (uint32_t)CFG_DEVTYPE_LEVEL)
-        {
-            is_sensor = true;               /* 这次绑的是液位: 开液位窗口 */
-            dev_type  = (uint8_t)CFG_DEVTYPE_LEVEL;
-        }
-        else if (t == (uint32_t)CFG_DEVTYPE_ALLINONE)
-        {
-            dev_type  = (uint8_t)CFG_DEVTYPE_ALLINONE;
-        }
-        else
-        {
-            return CLOUD_EC_PARAM;          /* 含 type=2: 不存在 */
-        }
-    }
-
-    /* 容量上限: 用户口径"总数 5 / 液位 5 / 声光 5", 与运行期 0x04 绑定握手里的
+    /* 容量上限与运行期 0x04 绑定握手里的
      * config_store_can_add 同口径。这条是纯配置判断, 不需要 LoRa —— 先在这里拦住,
      * 别等到配对成功了才发现放不下。
      * 【注意】这里只判"还剩不剩位置", 真正的绑定由 config_store 在收到设备 ACK 后
      *   经 lora_business 的 config_store_bind_device 完成(即 0x04 握手路径里再判一次)。 */
-    if (!config_store_can_add(is_sensor))
+    if (!config_store_can_add(true))
     {
         return CLOUD_EC_LIMIT;          /* 1009 */
     }
 
     if (s_pair_fn == NULL)
     {
-        /* 配对后端还没注册(main.c 还没注册): 明确回 1006,
-         * 绝不能做"假装窗口已开" —— 平台会一直等 event.device{bound}, 永远等不到。 */
-        log_info("[CLOUD] %s: 本机还没注册配对后端, 回 1006\r\n",
-                 is_sensor ? "sen.bind" : "dev.bind");
+        log_info("[CLOUD] sen.bind: 本机还没注册配对后端, 回 1006\r\n");
         return CLOUD_EC_STATE;
     }
 
-    if (!s_pair_fn(serial, name, (uint16_t)window_s, is_sensor, dev_type))
+    if (!s_pair_fn(serial, name, (uint16_t)window_s))
     {
         return CLOUD_EC_INTERNAL;       /* 开窗口失败 -> 1007 */
     }
@@ -785,403 +662,6 @@ static int cloud_cmd_bind(const cloud_req_t *req, cJSON *data, bool is_sensor)
 
 int cloud_cmd_sen_bind(const cloud_req_t *req, cJSON *data)
 {
-    return cloud_cmd_bind(req, data, true);
+    return cloud_cmd_bind(req, data);
 }
 
-int cloud_cmd_dev_bind(const cloud_req_t *req, cJSON *data)
-{
-    return cloud_cmd_bind(req, data, false);
-}
-
-/**
- * @brief dev.ctrl —— 手动控制联动设备(文档 5.4 第 14 条; 用户 2026-09-30 第 6 条)
- *
- *   参数: uid     必填; 本工程口径是 26 位 hex 串, 也接受 "all"(=全部启用的联动设备)
- *                   —— 文档写的是 uint16 addr, 那是偏差 D-4(用户已确认用 uid),
- *                      所以字符串 "all" 就是本工程对文档 "all" 的对应写法。
- *         gear    必填 0~3
- *         voice   可选: ★2026-11-11 新增★ 本次播报的音色, 用【云端码】
- *                 3 艾佳 / 51 艾诚 / 52 艾达 / 53 艾琪 / 54 唐老鸭 / 55 艾彤
- *                 (与 rule.set 的 voice 同一套码)。只影响这一次播报, 不写配置;
- *                 不给就用 gears[gear] 配的音色。
- *         ledText 可选: 覆盖档位模板里的 LED 文本(给了就用给的)
- *         ttsText 可选: 同上(语音文本)
- *   响应: code 0 + data.results[{uid,code}]
- *   语义: 执行后进入 manual 模式(改 rules.mode=manual); manualTimeoutSeconds 到期
- *         由主循环自动回归 auto; manual 期间阈值变化也不再自动联动
- *         (抑制点在 level_supervisor.c: 看 cfg->rules.mode)。
- *
- * 【与文档的一处有意差异: 应答时机】
- *   文档要求网关等 LoRa ACK(超时 5 秒)后应答, 个别设备失败在 results 中体现。
- *   本工程是【非阻塞】架构: 命令处理不能把主循环卡 5 秒等空口 —— 所以:
- *     · results[].code 反映【受理投递】的结果:
- *         0    = 已投递到下发缓存(空口发送与重试由 lora_business 的 poll 负责)
- *         1003 = 目标设备不存在(不在从机表里 / 已停用)
- *         1007 = 网关内部错误(uid 非法 / 组帧失败)
- *     · 真正的空口执行结果(ACK / 5s 超时 / 重试耗尽)由 event.action 异步补报
- *       —— 这也正是文档 5.4 末要求的那条("后台重试并经 event.action 补报结果")。
- */
-/* ★2026-10-10: dev.ctrl 的 ledTextShowMode / ledColor 是【逗号串】(与 gears[] 一致)。
- * 这里放两个纯解析小助手, 严格但简单: 格式不对就返回 false -> 调用方回 1001。
- * ⚠️ 不宽容: "1, 2"(带空格)、"1,2,3"、单个值 都判非法 —— 宁可让平台立刻发现写错了,
- *    也不要静默用半个值下发到现场设备上。 */
-
-/** 解析 "a,b" 形式、两个 0~9 的数字 -> out[0]/out[1] */
-static bool cloud_parse_u8_pair(const char *s, uint8_t *out)
-{
-    if ((s == NULL) || (out == NULL)) { return false; }
-    if ((s[0] < '0') || (s[0] > '9')) { return false; }
-    if (s[1] != ',')                  { return false; }
-    if ((s[2] < '0') || (s[2] > '9')) { return false; }
-    if (s[3] != '\0')                 { return false; }
-
-    out[0] = (uint8_t)(s[0] - '0');
-    out[1] = (uint8_t)(s[2] - '0');
-    return true;
-}
-
-/** 解析 "off,red" 形式的两个颜色名 -> 0 off / 1 red / 2 green / 3 yellow
- *  ⚠️ 顺序必须与 cfg_led_color_t 一致 —— 那个枚举是【按空口码值重排过的】
- *    (OFF=0, RED=1, GREEN=2, YELLOW=3), 顺序写错会导致红绿互换这种静默 bug。 */
-static bool cloud_parse_color_pair(const char *s, uint8_t *out)
-{
-    static const char *const names[4] = { "off", "red", "green", "yellow" };
-    const char *comma;
-    uint8_t     h;
-
-    if ((s == NULL) || (out == NULL)) { return false; }
-    comma = strchr(s, ',');
-    if (comma == NULL) { return false; }
-
-    for (h = 0u; h < 2u; h++)
-    {
-        const char *b   = (h == 0u) ? s : (comma + 1);
-        size_t      n   = (h == 0u) ? (size_t)(comma - s) : strlen(comma + 1u);
-        uint8_t     k;
-        bool        hit = false;
-
-        for (k = 0u; k < 4u; k++)
-        {
-            if ((strlen(names[k]) == n) && (strncmp(names[k], b, n) == 0))
-            {
-                out[h] = k;
-                hit    = true;
-                break;
-            }
-        }
-        if (!hit) { return false; }
-    }
-    return true;
-}
-
-int cloud_cmd_dev_ctrl(const cloud_req_t *req, cJSON *data)
-{
-    char               uid[CFG_UID_STR_MAX];
-    /* ★2026-10-08: LED 文本覆盖参数由单段改为两段★
-     * 用户选定方案 (A): `ledText` -> `ledText1` + `ledText2`
-     * (与 gears[] 的 ledTextTemplate1/2 命名一致)。 */
-    char               led1[CFG_LEDTEXT_MAX + 1u];
-    char               led2[CFG_LEDTEXT_MAX + 1u];
-    char               tts[CFG_TTSTEXT_MAX + 1u];
-    const char        *only_uid;
-    const config_store_t *cfg = config_store_get();
-    lora_gear_result_t res[CFG_DEVICE_MAX];
-    uint8_t            total = 0u;
-    uint32_t           gear;
-    int                sent;
-    uint8_t            i;
-    cJSON             *arr;
-
-    if ((req->data == NULL) || (cfg == NULL)) { return CLOUD_EC_PARAM; }
-
-    /* ---- 目标: "all" 或具体 uid ---- */
-    if (!cj_get_str(req->data, "uid", uid, (uint16_t)sizeof(uid)))
-    {
-        return CLOUD_EC_PARAM;
-    }
-    if (strcmp(uid, "all") == 0)
-    {
-        only_uid = NULL;                     /* NULL = 全部启用的联动设备 */
-    }
-    else
-    {
-        if (!cfg_uid_valid(uid)) { return CLOUD_EC_PARAM; }
-        only_uid = uid;
-    }
-
-    /* ---- 档位 ---- */
-    if (cj_get(req->data, "gear", NULL, 0u) != CJ_NUM) { return CLOUD_EC_PARAM; }
-    gear = cj_get_uint(req->data, "gear", 0u);
-    if (gear >= (uint32_t)CFG_GEAR_COUNT) { return CLOUD_EC_PARAM; }
-
-    /* ---- 可覆盖文本: ★没给就是空, 不再用档位模板渲染★ ----
-     * (2026-10-28 更正段标题: 原来写"没给就用档位模板 + 当前水位渲染",
-     *  那是 2026-10-24 之前的老逻辑, 与下面 863~870 行的说明自相矛盾)
-     * ★★2026-10-09 用户口径: "给了空串就是空, 不要加默认参数"★★
-     * --------------------------------------------------------------------------
-     * 【原来错在哪】老代码只看 `led1[0] == '\0'` 来判断"要不要套模板" ——
-     *   于是 `ledText1:""`(平台明确要求置空) 会被当成"没给", 又去渲染档位模板,
-     *   平台看到的是"我说了空, 结果又冒出模板文字"。
-     *
-     * 【现在】用 given 标志区分两种语义:
-     *     字段【没出现】        -> 用档位模板 + 当前水位渲染
-     *     字段出现(含空串 "")   -> 原样使用, 空串就是空, 不套模板、不加默认
-     *   ⇒ 这是 JSON 里"缺省"与"显式给空"的区分, 必须靠 given, 不能靠内容是否为空。
-     *
-     * ⚠️ 超长仍按老规矩回 1001(不截断)。 */
-    bool given1 = cloud_field_given(req->data, "ledText1");
-    bool given2 = cloud_field_given(req->data, "ledText2");
-    bool givenT = cloud_field_given(req->data, "ttsText");
-
-    led1[0] = '\0';
-    led2[0] = '\0';
-    tts[0]  = '\0';
-    if (given1 && (!cloud_take_str_field(req->data, "ledText1", led1, (uint16_t)sizeof(led1))))
-    {
-        return CLOUD_EC_PARAM;               /* 超长 -> 1001, 不截断 */
-    }
-    if (given2 && (!cloud_take_str_field(req->data, "ledText2", led2, (uint16_t)sizeof(led2))))
-    {
-        return CLOUD_EC_PARAM;
-    }
-    if (givenT && (!cloud_take_str_field(req->data, "ttsText", tts, (uint16_t)sizeof(tts))))
-    {
-        return CLOUD_EC_PARAM;
-    }
-
-    /* ★★2026-10-24 用户口径: 云端手动控制【不做任何文字填充】★★
-     *
-     * 【现象】dev.ctrl 只给了 ledText1("早上好"), ledText2 / ttsText 为空(或没给),
-     *   网关却把 gears[gear] 里的模板(路面积水{level}CM / 缓慢通行 / TTS)填了上去,
-     *   平台看到"我说空, 结果又冒出档位文字"。
-     *
-     * 【为什么以前会填】老逻辑把"字段没出现"当成"用档位模板 + 当前水位渲染"。
-     *   但手动控制是【平台明确指定文案】的场景, 平台没给就是"不要这段文字",
-     *   不是"帮我按档位补一段"。
-     *
-     * 【现在的语义】dev.ctrl 只做透传:
-     *   · 字段出现(含 "") -> 原样使用;
-     *   · 字段没出现       -> 留空(什么都不发), 绝不拿档位模板补。
-     * 档位模板的渲染只保留在【边缘联动】那条路径(level_supervisor -> 0x03),
-     * 那条才是"网关自己按水位决定文案"的地方。
-     *
-     * 说明: 平台给了的文字里的 {level} 仍然会被替换(见下面那段 2026-10-14 的修复),
-     *       这与"不自动填充"不冲突 —— 一个是替换占位符, 一个是凭空补文案。 */
-
-    /* ==========================================================================
-     * ★★2026-10-14 修复: 平台【给的】文字也要过 {level} 渲染 ★★
-     * --------------------------------------------------------------------------
-     * 【原来错在哪】上面那一支只在"字段【没给】"时渲染(用的是 cfg->gears[gear]
-     *   的档位模板)。平台【明确给了】ledText1/ledText2/ttsText 时, 文字被
-     *   【原样下发】—— 里面的 {level} 一个字都没替换。用户 2026-10-14 实测:
-     *       dev.ctrl: {"uid":"310001","gear":3,"ledText1":"路面积水了{level}CM", ...}
-     *       [GEAR] 档位 3 已投递 1/1 台联动设备(手动控制)(LED1="路面积水了{level}CM" ...)
-     *       [TX] ... E8 B7 AF E9 9D A2 E7 A7 AF E6 B0 B4 E4 BA 86
-     *                7B 6C 65 76 65 6C 7D            <-- ★ "{level}" 原样上空口 ★
-     *                43 4D ...
-     *   ⇒ LED 屏上显示的就是字面的 "{level}"。
-     *
-     * 【用户口径(2026-10-14, 方案甲)】覆盖文字【生效】(不是退回档位模板),
-     *   但必须把 {level} 填成当前水位。
-     * 【没有水位数据时】用户定: 按 0 处理(⇒ 渲染成 "0 ", 一位数补空格的规则生效)。
-     *
-     * ⚠️ 两条实现要点:
-     *   1) 必须用【临时缓冲】: level_render_template(out, cap, tmpl, mm) 的 out 与
-     *      tmpl 若是同一块内存会自我覆盖 ⇒ 不能原地渲染 led1。
-     *   2) 渲染失败(装不下)时 level_render_template 会把 out[0] 置 '\0',
-     *      语义是"绝不发半截文本给 LED" ⇒ 这里按 1001 拒绝, 与上面"超长回 1001"
-     *      的口径一致(不静默降级成空文案)。
-     * ========================================================================== */
-    if (given1 || given2 || givenT)
-    {
-        int32_t lv         = 0;
-        uint8_t dummy_gear = 0u;
-        bool    have_lv    = level_supervisor_last(&lv, &dummy_gear);
-
-        if (!have_lv) { lv = 0; }       /* 用户定(甲): 还没有过有效水位 -> 按 0 */
-
-        if (given1)
-        {
-            char t[CFG_LEDTEXT_MAX + 1u];
-            if (level_render_template(t, (uint16_t)sizeof(t), led1, lv) == 0u)
-            {
-                return CLOUD_EC_PARAM;  /* 装不下 -> 1001, 不发半截 */
-            }
-            (void)memcpy(led1, t, sizeof(led1));
-        }
-        if (given2)
-        {
-            char t[CFG_LEDTEXT_MAX + 1u];
-            if (level_render_template(t, (uint16_t)sizeof(t), led2, lv) == 0u)
-            {
-                return CLOUD_EC_PARAM;
-            }
-            (void)memcpy(led2, t, sizeof(led2));
-        }
-        if (givenT)
-        {
-            char t[CFG_TTSTEXT_MAX + 1u];
-            if (level_render_template(t, (uint16_t)sizeof(t), tts, lv) == 0u)
-            {
-                return CLOUD_EC_PARAM;
-            }
-            (void)memcpy(tts, t, sizeof(tts));
-        }
-    }
-
-    /* ---- ★★2026-10-10 新增: 样式覆盖 ledShowMode / ledTextShowMode / ledColor ★★
-     * --------------------------------------------------------------------------
-     * 【原来缺什么】这三字段一直被【静默忽略】—— 上面只解析了 uid/gear/三段文本。
-     *   而空口 out[3] 里本来就有位置(见 level_eval.c 的 level_gear_build_payload):
-     *       bit7   ledShowMode      0 横 / 1 竖
-     *       bit5,4 ledTextShowMode  半屏1/半屏2: 0 居中 / 1 对齐
-     *       bit3,2 / bit1,0  ledColor  半屏1/半屏2: off/red/green/yellow
-     *   ⇒ 只需要把值传下去, 设备侧一个字都不用改。
-     *
-     * 【写法与 gears[] 完全一致】两个半屏用【逗号串】: "1,2" / "red,yellow"。
-     *   用户 2026-10-10 确认: ledShowMode 只有 0/1; ledTextShowMode 只有 0/1(居中/对齐)。
-     *
-     * 【语义】临时盖一下 —— 不写 config_store、不持久化; 与文本那边一样用
-     *   cloud_field_given() 区分"没给"(用档位配置)和"给了"(用覆盖值)。
-     *   解析失败一律回 1001(和文本字段一个口径, 不静默忽略)。 */
-    {
-        uint8_t style_mask = 0u;
-        uint8_t st_show = 0u;
-        uint8_t st_text[2] = { 0u, 0u };
-        uint8_t st_color[2] = { 0u, 0u };
-
-        /* ---- ledShowMode: 数字, 只有 0/1 ---- */
-        if (cloud_field_given(req->data, "ledShowMode"))
-        {
-            uint32_t v;
-
-            if (cj_get(req->data, "ledShowMode", NULL, 0u) != CJ_NUM) { return CLOUD_EC_PARAM; }
-            v = cj_get_uint(req->data, "ledShowMode", 0xFFFFu);
-            if (v > 1u) { return CLOUD_EC_PARAM; }
-            st_show = (uint8_t)v;
-            style_mask |= LORA_STYLE_SHOW_MODE;
-        }
-
-        /* ---- ledTextShowMode: "a,b" 两个 0/1 ---- */
-        if (cloud_field_given(req->data, "ledTextShowMode"))
-        {
-            char s[16];
-
-            if (!cj_get_str(req->data, "ledTextShowMode", s, (uint16_t)sizeof(s)))
-            {
-                return CLOUD_EC_PARAM;
-            }
-            if (!cloud_parse_u8_pair(s, st_text)) { return CLOUD_EC_PARAM; }
-            if ((st_text[0] > 1u) || (st_text[1] > 1u)) { return CLOUD_EC_PARAM; }
-            style_mask |= LORA_STYLE_TEXT_MODE;
-        }
-
-        /* ---- ledColor: "off,red" 之类 ---- */
-        if (cloud_field_given(req->data, "ledColor"))
-        {
-            char s[24];
-
-            if (!cj_get_str(req->data, "ledColor", s, (uint16_t)sizeof(s)))
-            {
-                return CLOUD_EC_PARAM;
-            }
-            if (!cloud_parse_color_pair(s, st_color)) { return CLOUD_EC_PARAM; }
-            style_mask |= LORA_STYLE_COLOR;
-        }
-
-        if (style_mask != 0u)
-        {
-            lora_business_set_gear_style(style_mask, st_show,
-                                         st_text[0], st_text[1],
-                                         st_color[0], st_color[1]);
-        }
-    }
-
-    /* ---- ★★2026-11-11: 音色覆盖 voice ★★
-     * --------------------------------------------------------------------------
-     * 【原来缺什么】dev.ctrl 只解析 uid/gear/三段文本/三个样式字段, `voice`
-     *   被【静默忽略】：平台发 {"gear":3,"voice":54,"ttsText":"..."},
-     *   设备照旧用 gears[3] 配的音色播报 —— 平台以为改了, 现场什么都没变。
-     *   实测就是用户 2026-11-11 那条 dev.ctrl。
-     *
-     * 【口径】收【云端码】3 / 51 / 52 / 53 / 54 / 55(与 rule.set 的 voice 完全一致),
-     *   用 cfg_voice_from_cloud() 换成设备 0~5; 其他值(含 6~50、56+)回 1001 ——
-     *   和文本超长、样式字段非法一个口径: 宁可让平台立刻发现写错, 不要静默忽略。
-     *
-     * 【只覆盖, 不落盘】与 ledColor/文本覆盖同样走"登记 -> apply -> clear":
-     *   dev.ctrl 是手动播一次, 不能把 Flash 里的档位音色改掉。 */
-    if (cloud_field_given(req->data, "voice"))
-    {
-        int vd;
-
-        if (cj_get(req->data, "voice", NULL, 0u) != CJ_NUM) { return CLOUD_EC_PARAM; }
-        vd = cfg_voice_from_cloud(cj_get_uint(req->data, "voice", 0xFFFFFFFFu));
-        if (vd < 0) { return CLOUD_EC_PARAM; }
-        lora_business_set_gear_voice((uint8_t)vd);
-    }
-
-    /* ---- 下发(投递到缓存; 空口回 ACK 由 lora_business 的 poll 负责) ---- */
-    sent = lora_business_apply_gear_ex((uint8_t)gear, only_uid, led1, led2, tts,
-                                       res, (uint8_t)CFG_DEVICE_MAX, &total);
-
-    /* ★2026-10-10: 覆盖是"临时盖一下", 用完立刻清 —— 否则会粘到下一次自动联动上。
-     * 放在这里(调用之后、任何 return 之前), 成功失败两条路都清。 */
-    lora_business_clear_gear_style();
-    if (sent < 0) { return CLOUD_EC_PARAM; }
-    if (total == 0u)
-    {
-        /* 一台都没选中: 指定的那台不存在/已停用, 或压根没有启用的联动设备 */
-        return CLOUD_EC_NO_DEVICE;           /* 1003 */
-    }
-
-    /* ---- 进入 manual 模式(★只改 RAM★; 抑制点在 level_supervisor) ----
-     * ★★2026-11-02 改: 不再写 Flash、不再抬 configVersion★★
-     * 【原来的问题】每次 dev.ctrl 都走 cloud_commit_config(): 擦写一次配置页
-     *   + configVersion +1。三个副作用:
-     *     ① 协议 §5.5 明写"manual 不跨重启持久化"(上电 app_boot 强制回 auto),
-     *        所以这次落盘【没有任何收益】, 只是白磨 Flash;
-     *     ② 平台按 configVersion 变化判断"配置被改了", 每次手动控制都会触发
-     *        一次无意义的配置比对/重下发;
-     *     ③ 现场每 4 分钟手动一次 = 每天 ~360 次页擦写, 对 512KB 片内 Flash
-     *        的擦写寿命是纯损耗。
-     * 【计时怎么办】原来"窗口重新计时"是靠 configVersion 变化被 app_manual_step()
-     *   看见; 现在显式调 level_supervisor_note_manual_cmd(), 语义不变、不碰 Flash。
-     * 【应答】configVersion 照旧回当前值(没变), 平台不会因此触发比对。 */
-    {
-        config_store_t *mut = config_store_get_mut();
-
-        if (mut != NULL)
-        {
-            mut->rules.mode = (uint8_t)CFG_RULE_MANUAL;
-        }
-        level_supervisor_note_manual_cmd();
-    }
-
-    /* ---- 应答 data.results[{uid,code}] + configVersion ---- */
-    arr = cJSON_AddArrayToObject(data, "results");
-    if (arr == NULL) { return CLOUD_EC_INTERNAL; }
-
-    for (i = 0u; (i < total) && (i < (uint8_t)CFG_DEVICE_MAX); i++)
-    {
-        cJSON *o = cJSON_CreateObject();
-
-        if (o == NULL) { return CLOUD_EC_INTERNAL; }
-        if ((cJSON_AddStringToObject(o, "uid", res[i].uid) == NULL) ||
-            (cJSON_AddNumberToObject(o, "code", (double)res[i].code) == NULL))
-        {
-            cJSON_Delete(o);
-            return CLOUD_EC_INTERNAL;
-        }
-        cJSON_AddItemToArray(arr, o);
-    }
-
-    if (cJSON_AddNumberToObject(data, "configVersion",
-                                (double)config_store_version()) == NULL)
-    {
-        return CLOUD_EC_INTERNAL;
-    }
-
-    log_info("[CTRL] dev.ctrl: uid=%s gear=%u -> 受理 %d/%u, 已进 manual 模式\r\n",
-             (only_uid != NULL) ? only_uid : "all", (unsigned)gear, sent, (unsigned)total);
-    return CLOUD_EC_OK;
-}

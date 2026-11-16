@@ -39,35 +39,11 @@ extern lora_dev_state_t fake_device_state;
 
 void fake_lora_business_reset(void);
 
-/* ---- 档位联动下发(dev.ctrl 与自动联动都走 lora_business_apply_gear_ex) ---- */
-extern int      fake_gear_calls;         /* 被调用次数 */
-extern int      fake_gear_last_gear;     /* 最后一次的档位 */
-extern int      fake_gear_uid_is_null;   /* 最后一次 only_uid 是否 NULL(="all") */
-extern char     fake_gear_last_uid[27];  /* 最后一次的 only_uid(空 = NULL) */
-extern char     fake_gear_last_led[80];  /* 最后一次的 LED 文本 */
-extern char     fake_gear_last_tts[80];  /* 最后一次的语音文本 */
-extern int      fake_gear_ret;           /* 让替身返回这个"受理台数" */
-extern int      fake_gear_total;         /* out_total 回填值 */
-extern uint16_t fake_gear_res_code;      /* res[0].code 回填值 */
-
-/** ★2026-11-11: dev.ctrl 的 voice 覆盖。0xFF = 本次没有覆盖;
- *  否则是"已经换算成设备号 0~5"的值(云端 54 应记为 5)。 */
-extern int      fake_last_voice_override;
-
-/** 真正下发(apply_gear_ex)那一刻的 voice 覆盖值 —— set 必须发生在 apply 之前,
- *  clear 之后 fake_last_voice_override 会回 0xFF, 所以断言看这个。 */
-extern int      fake_voice_at_apply;
-
-/** lora_business_clear_gear_style() 被调用的次数(覆盖必须在下发后清掉) */
-extern int      fake_style_cleared;
-
-/** 假的 pair_hook: 记录 cloud_proto 传下来的 serial/name/窗口/类型 */
+/** 假的 pair_hook: 记录 cloud_proto 传下来的 serial/name/窗口(毕设版固定液位, 3 参数) */
 extern int      fake_pair_calls;
 extern char     fake_pair_serial[24];
 extern char     fake_pair_name[40];
 extern uint16_t fake_pair_window;
-extern bool     fake_pair_is_sensor;
-extern uint8_t  fake_pair_dev_type;   /* ★ 第 11 条: dev.bind 的 type(1/2/3) */
 
 /* ---- ★2026-10-05: sen.set -> LoRa 0x01 参数下发(lora_business_set_sensor_params) ----
  * 用来断言"cloud_proto 确实把参数交给了业务层, 且单位/数值没被改写"。 */

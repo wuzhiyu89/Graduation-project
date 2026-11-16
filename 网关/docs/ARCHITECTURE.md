@@ -1,5 +1,12 @@
 # 架构总览
 
+> ⚠️ **毕设版范围声明**：本固件为毕业设计裁剪版，**从机只有液位传感器**。
+> 原独立项目的「声光报警器 / 一体机」联动、档位下发、`dev.*` / `rule.*` 云命令、
+> `event.action` / `event.status_change` 事件产生端均已删除（`app/service/level_supervisor.c`、
+> `app/links/lora/lora_alarm.c`、`app/core/app_level.c`、`app/cloud/cloud_cmd_rule.c`
+> 已移至 `_deleted_backup/`）。本文中出现上述模块的叙述是旧版架构的历史存档，
+> **对毕设版不适用**。当前水位状态标签纯函数保留在 `app/service/level_eval.c`。
+
 > 这份文档回答四个问题：**系统由哪些层组成、一帧数据怎么流、每个目录负责什么、
 > 改代码时必须守住哪些约束。**
 > 面向第一次接手的人（或 AI）：读完这一篇，再按需看模块头部的注释。

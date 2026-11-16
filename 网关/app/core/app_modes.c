@@ -22,6 +22,7 @@
 #include "project_config.h"
 #include "lora_proto.h"
 #include "lora_business.h"
+#include "utils.h"
 
 #if MAIN_LORA_RAW_TEST
 #include "radio.h"
@@ -160,54 +161,17 @@ static void rawtest_print_counters(const char *tag)
  */
 static void rawtest_send_probe(void)
 {
-    /* ⚠️ 原本这里有一段"运行时把探针填成全 0xAA"的循环, 现在改成直接给下面那个
-     *    常量帧(内容可编辑, 见 v99 改动)。所以 i 和 RAWTEST_PROBE_LEN 暂时用不到了 ——
-     *    保留在注释里: 一是本工程要求【零警告】(留着声明会报 unused variable),
-     *    二是以后想改回"运行时填充"时可以直接照抄。 */
-    // uint16_t i;
-    // for (i = 0U; i < RAWTEST_PROBE_LEN; i++)
-    // {
-    //     s_rawtest_probe[i] = 0xAAU;
-    // }
-
+    uint16_t i;
     bool ok;
 
-    static const uint8_t s_rawtest_probe[] = {
-        0xAA, 0x55,       /* 帧头 */
-        0x01,             /* 协议版本 */
-        0x11, 0x00, 0x01, /* 网关地址：类型1 环境1 编号1 */
-        0x31, 0x00, 0x01, /* 设备地址：类型3 环境1 编号1 */
-        0x03,             /* 功能码：0x03 设置声光报警器 */
-        0x1B,             /* 数据长度 = 27 字节 */
-        /* ---- data 27 字节 ---- */
-        0x01, /*  0 总电源：1 开 */
-        0x05, /*  1 灯光模式：5 爆闪 */
-        0x50, /*  2 功放音量：80 */
-        0x01, /*  3 LED开关机：1 开 */
-        0x01, /*  4 LED版式：1 全屏 */
-        0x01, /*  5 显示模式：1 滚动 */
-        0x0F, /*  6 屏幕亮度：15 */
-        0x14, /*  7 滚动速度：20 */
-        0x12, /*  8 文本长度 = 18 */
-        /* 文本："水深危险，禁止通行" */
-        /* ⚠️ 下面这 18 字节是【旧探针的 GB2312 编码】, 只为与历史台架记录可比而保留。
-         *    生产路径(level_gear_build_payload)组帧用 UTF-8(汉字 3 字节),
-         *    两者不要混用(2026-10-28 按用户裁决: 网关不做 GB2312 转码)。 */
-        0xCB, 0xAE, 0xC9, 0xEE, 0xCE, 0xA3, 0xCF, 0xD5, 0xA3, 0xAC,
-        0xBD, 0xFB, 0xD6, 0xB9, 0xCD, 0xA8, 0xD0, 0xD0,
-        /* ---- CRC16 (Modbus) 低字节在前 ---- */
-        0x5D, 0x17};
+    /* 探针刻意不携带任何业务语义：全 0xAA，只用于确认射频发送路径。
+     * 毕设版只有液位传感器，不能再用某一类联动设备的真实帧当通用探针。 */
+    for (i = 0U; i < RAWTEST_PROBE_LEN; i++)
+    {
+        s_rawtest_probe[i] = 0xAAU;
+    }
 
-    // log_info("[RAWTEST] ① 发【全 0xAA 原始探针】%u 字节(与协议格式无关)...\r\n", (unsigned)RAWTEST_PROBE_LEN);
-
-    /* 【2026-09-29 移除】这里原来有一段临时的 utf8_to_hexstr() 试调用:
-     *     char buf[256]; utf8_to_hexstr(text, buf, sizeof(buf));
-     *  它有两个问题: ① 256 传进 uint8_t 形参被截成 0 -> 函数立刻返回 -1, 那行
-     *  log 永远不会打印; ② 在 radio 测试函数里做文本转码本来也没用。
-     *  真正的"云端文本 -> 三字节组帧"已经按用户第 6 条做成 utils 的
-     *  utf8_pack_3byte()(见 utils.h), 用到它的地方在 dev.ctrl/联动下发那条链上。 */
-
-    ok = lora_proto_send_raw(s_rawtest_probe, (uint8_t)sizeof(s_rawtest_probe));
+    ok = lora_proto_send_raw(s_rawtest_probe, RAWTEST_PROBE_LEN);
 
     log_info("[RAWTEST] ① 发射结果: %s\r\n",
              ok ? "TX_DONE 成功(空口上确实发完了)"
@@ -234,7 +198,7 @@ static void rawtest_send_probe(void)
  *   ⚠ 口径说明(如实写清): 网关正常是【不会】主动发 0x02 的(0x02 是传感器上行)。
  *     这里发它纯粹是为了让对端一眼认出"这是一条格式完全正确的帧", 便于区分它与噪声。
  *     若现场更想让对端走"下行指令"那条路, 把下面的 func/data 改成 0x01(设置液位参数)
- *     或 0x03(设置声光)即可 —— 组帧/CRC 都由生产函数负责, 改这两个字段不会算错 CRC。
+ *     即可 —— 组帧/CRC 都由生产函数负责, 改这两个字段不会算错 CRC。
  */
 static void rawtest_send_legal_frame(void)
 {
@@ -329,50 +293,47 @@ static void rawtest_do_round(void)
  *   除发射之外, 主循环里【没有任何阻塞延时】。
  */
 /* ---------- 【模式③: 可编辑的测试报文】----------
- * ★ 这里放的是【整帧】, 原样发给射频 —— 不组帧、不自动算 CRC ★
- *   所以: 你改了 payload, 就必须【自己重算 CRC 并改最后两个字节】,
- *   否则对端会因 CRC 不过而整帧丢弃(现象: 对端毫无反应)。
- *   CRC 规则(已用三帧现场数据复算验证过):
- *       crc16_modbus, 覆盖【版本字节 .. data 末尾】, 结果【低字节在前】。
- *   下面这 40 字节是现场真实用过的声光帧(func=0x03, 文字"水深危险，禁止通行"),
- *   其 CRC = 5D 17 已按该规则复算吻合 ✓ —— 可直接拿它当模板改。
- *
- * 【改法示例】只想换文字: 保持总长度不变(改 dlen 与 CRC 即可); 若总长变了,
- *   记得同时改 dlen(第 11 个字节)与 CRC(最后两字节)。
+ * ★ 这里放的是【整帧】, 原样发给射频 ★
+ *   毕设版只保留液位设备口径。帧内容是 13 字节 UID 的 0x05 解绑请求:
+ *   AA 55 | 01 | gw_uid[13] | dev_uid[13] | 05 | 00 | crc16
+ *   CRC 覆盖【版本字节 .. data 末尾】, 低字节在前；这里每次发送前重算,
+ *   避免手改 UID/功能码后忘记同步 CRC。
  */
-static const uint8_t s_rawtest_user_frame1[] =
-{
-    0xAA, 0x55,                     /* 0-1   帧头 */
-    0x01,                           /* 2     版本 */
-    0x11, 0x00, 0x01,               /* 3-5   网关地址(发出方) */
-    0x31, 0x00, 0x01,               /* 6-8   设备地址(接收方) */
-    0x03,                           /* 9     功能码(0x03=设置声光) */
-    0x1B,                           /* 10    数据长度 = 27 */
-    0x01, 0x05, 0x50, 0x01, 0x01, 0x01, 0x0F, 0x14, 0x12,       /* 11-19 声光参数 9B */
-    0xCB, 0xAE, 0xC9, 0xEE, 0xCE, 0xA3, 0xCF, 0xD5, 0xA3, 0xAC, /* 20-29 "水深危险，" */
-    0xBD, 0xFB, 0xD6, 0xB9, 0xCD, 0xA8, 0xD0, 0xD0,             /* 30-37 "禁止通行"   */
-    0x5D, 0x17                      /* 38-39 CRC16(低字节在前) —— 改了上面就必须重算! */
-};
+#define RAWTEST_USER_FRAME_LEN   (LORA_FRAME_OVERHEAD + 0U)
 
-static const uint8_t s_rawtest_user_frame[] =
+static uint8_t s_rawtest_user_frame[RAWTEST_USER_FRAME_LEN];
+
+static void rawtest_build_user_frame(void)
 {
-		0xAA, 0x55,                     /* 0-1   帧头 */
-    0x01,                           /* 2     版本 */
-    0x11, 0x00, 0x01,               /* 3-5   网关地址(发出方) */
-    0x31, 0x00, 0x01,               /* 6-8   设备地址(接收方) */
-    0x05,                           /* 9     功能码(0x05=解绑设备) */
-		0x00,
-		0xE9,0x25
-	
-};
+    uint16_t crc;
+
+    (void)memset(s_rawtest_user_frame, 0, sizeof(s_rawtest_user_frame));
+
+    s_rawtest_user_frame[0] = 0xAAU;
+    s_rawtest_user_frame[1] = 0x55U;
+    s_rawtest_user_frame[2] = LORA_PROTO_VER;
+
+    /* 网关 UID: 类型 1 + 编号 1；设备 UID: 液位类型 2 + 编号 1 */
+    s_rawtest_user_frame[LORA_OFF_GW_UID]   = LORA_ADDR_MAKE_BYTE(LORA_DEV_TYPE_GATEWAY,     LORA_ENV_ID_DEFAULT);
+    s_rawtest_user_frame[LORA_OFF_GW_UID+12] = 0x01U;
+    s_rawtest_user_frame[LORA_OFF_DEV_UID]  = LORA_ADDR_MAKE_BYTE(LORA_DEV_TYPE_LEVEL_SENSOR, LORA_ENV_ID_DEFAULT);
+    s_rawtest_user_frame[LORA_OFF_DEV_UID+12] = 0x01U;
+    s_rawtest_user_frame[LORA_OFF_FUNC]     = LORA_FUNC_UNBIND;
+    s_rawtest_user_frame[LORA_OFF_DLEN]     = 0x00U;
+
+    crc = crc16_modbus(&s_rawtest_user_frame[2], (uint16_t)(sizeof(s_rawtest_user_frame) - 4U));
+    s_rawtest_user_frame[sizeof(s_rawtest_user_frame) - 2U] = (uint8_t)(crc & 0xFFU);
+    s_rawtest_user_frame[sizeof(s_rawtest_user_frame) - 1U] = (uint8_t)(crc >> 8);
+}
 
 static void rawtest_send_user_frame(void)
 {
     uint8_t i;
 
     rawtest_print_counters("发射前");
+    rawtest_build_user_frame();
 
-    log_info("[RAWTEST] 发整帧 %u 字节(原样发出, 不自动算 CRC): ",
+    log_info("[RAWTEST] 发整帧 %u 字节(液位 0x05 解绑帧): ",
              (unsigned)sizeof(s_rawtest_user_frame));
     for (i = 0u; i < (uint8_t)sizeof(s_rawtest_user_frame); i++)
     {
@@ -502,7 +463,7 @@ static void app_mode_rawtest_run(void)
 /* ==================================================================
  * 模式②: 从机配对模式  (MAIN_MODE_PAIRING=1)
  * ==================================================================
- * 【场景】从机(液位/声光)出厂后还不知道网关是谁, 于是用【未配对网关地址 FF FF FF】
+ * 【场景】液位从机出厂后还不知道网关是谁, 于是用【未配对网关地址 FF FF FF】
  *   发一条配对请求; 网关收到后回一条 ACK, 从机从 ACK 里学到网关地址, 配对完成。
  *
  * 【现场实测的两帧 —— 本实现的依据】(CRC 已用 crc16_modbus 复算验证过)
@@ -545,14 +506,12 @@ static void pairing_on_frame(const lora_frame_t *frame, int8_t rssi, int8_t snr)
      * 从机收到 ACK 后会把内部网关值从 FFFFFF 改成本网关地址, 然后一直回 0x80 ACK。 */
     if (frame->func == PAIRING_FUNC_REQUEST)
     {
-        /* 组 ACK: gw_uid 换成本网关, func=0x80(ACK_OK), dlen=0。CRC 由协议层算。
-         * 注意 data_len=0, 所以 data[] 里的内容不参与组帧, 不必清零。 */
+        /* 组 ACK: gw_uid 换成本网关, func=0x80(ACK_OK), dlen=0。CRC 由协议层算。 */
+        (void)memset(&ack, 0, sizeof(ack));
         ack.gw_uid[0] = (uint8_t)((PAIRING_GW_UID_HEX >> 16) & 0xFFu);
         ack.gw_uid[1] = (uint8_t)((PAIRING_GW_UID_HEX >> 8) & 0xFFu);
         ack.gw_uid[2] = (uint8_t)(PAIRING_GW_UID_HEX & 0xFFu);
-        ack.dev_uid[0] = frame->dev_uid[0];
-        ack.dev_uid[1] = frame->dev_uid[1];
-        ack.dev_uid[2] = frame->dev_uid[2];
+        (void)memcpy(ack.dev_uid, frame->dev_uid, LORA_UID_BYTES);
         ack.func       = (uint8_t)LORA_FUNC_RESP_OK;
         ack.data_len   = 0u;
 
@@ -578,28 +537,31 @@ static void pairing_on_frame(const lora_frame_t *frame, int8_t rssi, int8_t snr)
      * 后从机已在 config_store 里, 直接可用。 */
     if (frame->func == LORA_FUNC_RESP_OK)
     {
-        /* dev_type = uid[0]高4位: 0x02=液位(sensor), 0x03=声光(alarm) */
-        bool is_sensor = ((uint8_t)(frame->dev_uid[0] >> 4) == 0x02U);
         char uid_hex[CFG_UID_STR_MAX];
         cfg_result_t r;
 
-        (void)cfg_uid_from_bytes(frame->dev_uid, uid_hex);  /* 3字节转hex, 不会失败 */
+        /* 毕设版只绑定液位从机；其它类型直接忽略，避免旧设备误入 sensors[]。 */
+        if (lora_addr_type(frame->dev_uid) != LORA_DEV_TYPE_LEVEL_SENSOR)
+        {
+            log_info("[PAIR] !! 非液位设备(func=0x80)，忽略\r\n");
+            return;
+        }
 
-        if (!config_store_can_add(is_sensor))
+        (void)cfg_uid_from_bytes(frame->dev_uid, uid_hex);  /* 13字节转hex, 不会失败 */
+
+        if (!config_store_can_add(true))
         {
             log_info("[PAIR] !! 收到 %s 的确认 ACK, 但从机表已满/已存在, 不写入\r\n",
                      uid_hex);
             return;
         }
-        /* dev_type: 设备类型(1 液位 / 3 一体机); is_sensor=true 时该参数被忽略传0。
-         * now_unix 传 0: PAIRING 模式未初始化时间源(RTC/4G), 绑定记录时间戳为 0
+        /* now_unix 传 0: PAIRING 模式未初始化时间源(RTC/4G), 绑定记录时间戳为 0
          * 不影响设备列表写入; 切回 CLOUD 模式后 cloud_proto 会用真实时间。 */
-        r = config_store_bind_device(uid_hex, "", "", is_sensor,
-                                      is_sensor ? 0U : 1U, 0U);
+        r = config_store_bind_device(uid_hex, "", "", true, 0U, 0U);
         if (r == CFG_OK)
         {
-            log_info("[PAIR] ★ 双向握手完成: %s(%s) 已写入本地从机列表 ★\r\n",
-                     uid_hex, is_sensor ? "液位" : "声光");
+            log_info("[PAIR] ★ 双向握手完成: %s(液位) 已写入本地从机列表 ★\r\n",
+                     uid_hex);
         }
         else
         {

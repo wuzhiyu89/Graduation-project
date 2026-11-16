@@ -257,14 +257,14 @@ static void test_full_config(void)
     /* ★2026-11-03: 音色 voice 0~5 ★
      *   JSON 里没给 -> 保持默认 0(艾佳女声); 给了 -> 按档位写入; 越界 -> 拒。 */
     CHECK(c.gears[0].voice == 0u && c.gears[3].voice == 0u,
-          "voice 缺省 = 0(艾佳女声)", 0);
+          "voice 缺省 = 0(艾佳女声)");
     {
         config_store_t vc;
 
         CHECK(config_store_from_json(&vc, "{\"gears\":[{\"gear\":2,\"voice\":5}]}") == CFG_OK,
               "gears[].voice=5 可解析");
         CHECK(vc.gears[2].voice == 5u && vc.gears[0].voice == 0u,
-              "voice 只改目标档位", 0);
+              "voice 只改目标档位");
         CHECK(config_store_from_json(&vc, "{\"gears\":[{\"gear\":2,\"voice\":6}]}") == CFG_ERR_RANGE,
               "voice=6 越界 -> CFG_ERR_RANGE");
     }

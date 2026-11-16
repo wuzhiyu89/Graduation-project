@@ -5,6 +5,9 @@
 网关/.git/
 液位/.git/
 
+# 已删除的一体机/联动源码仅本地留档可回退，不上传交付仓库
+网关/_deleted_backup/
+
 # 操作系统临时文件
 Thumbs.db
 Desktop.ini

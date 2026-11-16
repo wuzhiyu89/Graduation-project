@@ -36,7 +36,6 @@
 #include "g4_urc.h"
 #include "last_value.h"
 #include "level_eval.h"
-#include "level_supervisor.h"
 #include "lora_business.h"
 #include "ota_health.h"
 #include "ota_http.h"
@@ -75,17 +74,8 @@ void app_fill_status(cloud_status_t *st)
     (void)memset(st, 0, sizeof(*st));
 
     /* 子设备在线/总数 —— 来自 LoRa 从机表
-     *
-     * ★2026-10-18: 判据统一到 lora_business_device_state_bytes() ★
-     *   以前这里直接用 sl[i].is_online, 而那个字段对【声光】是"收到过帧/绑定过"
-     *   的粘滞标志 —— 声光断电后它仍然是 true(声光平时不收帧, 永远不会被清),
-     *   于是出现自相矛盾: dev.query 说 online:false(按"3 条 0x03 都没成功"判),
-     *   status.report 的 devicesOnline 却还把它算作在线。
-     *   现在两处共用同一份判据(见 lora_business_device_state_bytes):
-     *     · 液位 : is_online(由 sensor_offline 状态机维护)
-     *     · 声光 : !alarm_offline_reported(3 条 0x03 都没成功才置位)
-     *   ⇒ status.report / sys.query_status / sen.query / dev.query 四处的
-     *     在线口径从此完全一致。 */
+     * 毕设版只有液位传感器; 在线判据用 lora_business_device_state_bytes()。
+     * 声光/一体机( devices_online/total ) 已随联动删除。 */
     sl  = lora_business_get_slave_list();
     cnt = lora_business_get_slave_count();
     for (i = 0u; (i < cnt) && (sl != NULL); i++)
@@ -93,21 +83,10 @@ void app_fill_status(cloud_status_t *st)
         bool on = (lora_business_device_state_bytes(sl[i].dev_uid)
                    == LORA_DEV_STATE_ONLINE);
 
-        if (sl[i].dev_type == SLAVE_TYPE_ALARM_OUT)
+        st->sensors_total++;
+        if (on)
         {
-            st->devices_total++;
-            if (on)
-            {
-                st->devices_online++;
-            }
-        }
-        else
-        {
-            st->sensors_total++;
-            if (on)
-            {
-                st->sensors_online++;
-            }
+            st->sensors_online++;
         }
     }
 
@@ -121,22 +100,13 @@ void app_fill_status(cloud_status_t *st)
      *   该字段已从 cloud_status_t / cloud_fill_status_json 移除(平台侧不再需要)。
      *   事件缓存照旧工作, 补报也照旧走 event_cache_peek/drop —— 只是不再对外
      *   报"待补报条数"。别在这里另加一个字段把它带回来。 */
-    /* ★ 2026-09-30: 不再是占位值 —— 取边缘评估算出的【实时】档位/状态。
-     *   以前这里恒填 "auto"/0, 平台看到的档位永远是 0。
-     * ★ 2026-11-02: mode 之前一直恒填 "auto"(注释写着"等 dev.ctrl 落地", 但
-     *   dev.ctrl 早就落地了, 这里没跟上) —— 平台在手动控制期间永远看到
-     *   mode="auto", 分不清"平台手动压档"和"水位自己降下来"。
-     *   协议 §5.1 的 mode 取值就是 auto / manual。 */
-    st->mode = (config_store_get()->rules.mode == (uint8_t)CFG_RULE_MANUAL)
-                   ? "manual" : "auto";
-    /* off fail-safe: 数据不可信 -> Offline + gear null */
-    {
-        bool off = app_level_off_failsafe_active();
-
-        st->current_status = off ? "Offline" : app_live_state_name();
-        st->gear_null      = off;
-        st->current_gear   = app_live_gear();
-    }
+    /* 毕设版: 没有联动/手动模式, mode 恒 "auto";
+     * 水位状态/档位由 app_live_* 提供(纯数据标签)。
+     * off fail-safe 的故障画面逻辑已随一体机删除, gear_null 恒 false。 */
+    st->mode           = "auto";
+    st->current_status = app_live_state_name();
+    st->gear_null      = false;
+    st->current_gear   = app_live_gear();
 }
 
 sys_err_t app_publish_status_json(void)

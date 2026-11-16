@@ -61,7 +61,6 @@ static struct
 {
     unbind_state_t state;
     uint8_t        uid[CFG_UID_BYTES];            /* 解绑目标设备 UID(13B) */
-    bool           is_sensor;         /* 设备类型(sensor=true / alarm=false), 用于事件回调 */
     uint8_t        slave_idx;         /* 从机表索引(0xFF = 无效); 解绑期间作"锁"用 */
     uint32_t       phase_start_tick;  /* 当前阶段开始 tick */
     uint32_t       last_send_tick;    /* 上次发 0x05 的 tick */
@@ -88,21 +87,18 @@ _Static_assert(sizeof(g_unbind.uid) == CFG_UID_BYTES,
  * lora_slave_del 会把末尾从机搬到当前格, s 已经不一定指向原来了)。
  *
  * 返回 true = 已删除; false = uid 解 hex 失败(运行期表仍删, 但 config_store 没动) */
-static bool _unbind_finalize(const uint8_t uid[CFG_UID_BYTES], bool is_sensor)
+static bool _unbind_finalize(const uint8_t uid[CFG_UID_BYTES])
 {
     char  uid_hex[CFG_UID_STR_MAX];
     /* cfg_uid_from_bytes 把 13 字节转 hex, 不会失败(非全 0 即有效) */
     (void)cfg_uid_from_bytes(uid, uid_hex);
-    /* ★2026-10-27: 解绑成功后清掉该 UID 遗留的下发缓存★
-     * 典型场景: 曾用本地 #bind(默认液位)把声光误绑成液位, 排过一条 0x01(带校时);
-     * 解绑/重绑成声光后缓存还在, 声光 IDLE 时会被 lora_try_send_alarm_idle() 发出去
-     * -> "声光又被校时"。这里一并清掉。 */
+    /* 清掉该 UID 遗留的下发缓存，避免重绑后旧指令被发出去。 */
     (void)data_cache_down_del_by_uid((uint8_t *)uid);
     (void)config_store_unbind_device(uid_hex, cloud_proto_get_now_ts());
     log_info("[UNBIND] %02X%02X%02X(%s) 已删除 config_store, 触发 UNBOUND 事件\r\n",
              uid[0], uid[1], uid[2], uid_hex);
     (void)lora_slave_del(uid);
-    lora_bind_fire_event(uid_hex, is_sensor, LORA_BIND_EVENT_UNBOUND);
+    lora_bind_fire_event(uid_hex, LORA_BIND_EVENT_UNBOUND);
     return true;
 }
 
@@ -146,7 +142,7 @@ static void _unbind_fire_event(lora_bind_event_t event)
     char uid_hex[CFG_UID_STR_MAX];
     /* cfg_uid_from_bytes 把 13 字节转 hex, 不会失败(非全 0 即有效) */
     (void)cfg_uid_from_bytes(g_unbind.uid, uid_hex);
-    lora_bind_fire_event(uid_hex, g_unbind.is_sensor, event);
+    lora_bind_fire_event(uid_hex, event);
 }
 
 /* 清从机表里目标 slave 的 state/pending_func —— 不删条目(失败/故障路径用,
@@ -251,11 +247,8 @@ void lora_unbind_logic(void)
 
     if (g_unbind.state == UNBIND_PHASE1)
     {
-        /* 阶段1 超时: 声光按固定 30s(常驻 RX); 液位按【上报周期】算 ——
-         * 休眠设备只有上报后的窗口能收包, 按秒算没有意义(见 lora_business.h 的说明)。 */
-        uint32_t limit = g_unbind.is_sensor
-                             ? _unbind_phase_ms(LORA_UNBIND_SENSOR_PHASE1_PERIODS)
-                             : (uint32_t)LORA_UNBIND_PHASE1_MS;
+        /* 液位是休眠设备：阶段1 按上报周期算，只有上报后的窗口能收包。 */
+        uint32_t limit = _unbind_phase_ms(LORA_UNBIND_SENSOR_PHASE1_PERIODS);
 
         if ((uint32_t)(now - g_unbind.phase_start_tick) >= limit)
         {
@@ -266,59 +259,34 @@ void lora_unbind_logic(void)
             _unbind_reset();
             return;
         }
-        /* 声光: 3s 间隔盲发; 液位: 不发墙钟帧, 由 lora_unbind_window_hit()
-         *   在它上报后的指令窗口里发(那才是唯一能收到的时候)。 */
-        if ((!g_unbind.is_sensor) &&
-            ((uint32_t)(now - g_unbind.last_send_tick) >= LORA_UNBIND_PHASE1_INTERVAL_MS))
-        {
-            _unbind_send_frame();
-        }
+        /* 不发墙钟帧，由 lora_unbind_window_hit() 在它上报后的指令窗口里发。 */
     }
     else if (g_unbind.state == UNBIND_WAIT_CLEAR)
     {
         /* 等 15s 给设备清网关值, 到了进阶段2 */
         if ((uint32_t)(now - g_unbind.phase_start_tick) >= LORA_UNBIND_WAIT_CLEAR_MS)
         {
-            log_info("[UNBIND] 等 15s 完成, 进入阶段2(%s)\r\n",
-                     g_unbind.is_sensor ? "液位: 观察上报周期内是否还响应"
-                                        : "10s, 最多循环 3 次");
+            log_info("[UNBIND] 等 15s 完成, 进入阶段2(观察上报周期内是否还响应)\r\n");
             g_unbind.state            = UNBIND_PHASE2;
             g_unbind.phase_start_tick = now;
             g_unbind.last_send_tick   = now;
-            if (!g_unbind.is_sensor)      /* 液位没有窗口, 不能盲发 */
-            {
-                _unbind_send_frame();
-            }
         }
     }
     else if (g_unbind.state == UNBIND_PHASE2)
     {
-        /* 超时没收到 ack = 设备已清网关值 = 解绑成功
-         *   声光: 固定 10s;
-         *   液位: ACK 之后【2 个上报周期内不再响应】—— 设备清完会重启进工厂流程、
-         *         不再上报, 所以这段时间里既不会有 0x02 也不会有 ack。 */
-        uint32_t limit = g_unbind.is_sensor
-                             ? _unbind_phase_ms(LORA_UNBIND_SENSOR_PHASE2_PERIODS)
-                             : (uint32_t)LORA_UNBIND_PHASE2_MS;
+        /* ACK 之后【2 个上报周期内不再响应】即判成功。 */
+        uint32_t limit = _unbind_phase_ms(LORA_UNBIND_SENSOR_PHASE2_PERIODS);
 
         if ((uint32_t)(now - g_unbind.phase_start_tick) >= limit)
         {
-            /* 成功路径: 先拷 uid/is_sensor, 再 _unbind_reset(清 g_unbind 释放锁),
-             * 最后 _unbind_finalize —— 它会 lora_slave_del 让 slave_idx 失效,
-             * 所以必须先 reset 释放索引引用, 再用 uid_copy 找条目删 */
+            /* 成功路径: 先拷 uid，再 _unbind_reset 释放索引引用，最后删表项。 */
             uint8_t uid_copy[CFG_UID_BYTES];
-            bool    is_sensor = g_unbind.is_sensor;
             memcpy(uid_copy, g_unbind.uid, CFG_UID_BYTES);
             log_info("[UNBIND] 阶段2 %lus 没收到 ack, 设备已清网关值, 解绑成功\r\n",
                      (unsigned long)(limit / 1000U));
             _unbind_reset();
-            (void)_unbind_finalize(uid_copy, is_sensor);
+            (void)_unbind_finalize(uid_copy);
             return;
-        }
-        if ((!g_unbind.is_sensor) &&
-            ((uint32_t)(now - g_unbind.last_send_tick) >= LORA_UNBIND_PHASE2_INTERVAL_MS))
-        {
-            _unbind_send_frame();
         }
     }
 }
@@ -336,24 +304,22 @@ void lora_unbind_logic(void)
 void lora_unbind_dev_cleared(void)
 {
     uint8_t uid_copy[CFG_UID_BYTES];
-    bool    is_sensor;
 
     if ((g_unbind.state != UNBIND_WAIT_CLEAR) && (g_unbind.state != UNBIND_PHASE2))
     {
         return;
     }
 
-    is_sensor = g_unbind.is_sensor;
     memcpy(uid_copy, g_unbind.uid, CFG_UID_BYTES);
     log_info("[UNBIND] 收到 %02X%02X%02X 的 0x04(gw=广播) = 它已清网关值, 立即判成功\r\n",
              uid_copy[0], uid_copy[1], uid_copy[2]);
     _unbind_reset();
-    (void)_unbind_finalize(uid_copy, is_sensor);
+    (void)_unbind_finalize(uid_copy);
 }
 
 bool lora_unbind_window_hit(uint8_t slave_idx)
 {
-    if ((g_unbind.state == UNBIND_IDLE) || (!g_unbind.is_sensor))
+    if (g_unbind.state == UNBIND_IDLE)
     {
         return false;
     }
@@ -433,8 +399,7 @@ int lora_business_unbind(const char *uid_hex)
     }
 
     lora_slave_t *s = &g_slave_list[idx];
-    bool    is_sensor = (s->dev_type == SLAVE_TYPE_SENSOR);
-    uint32_t now      = get_tick_ms();
+    uint32_t now    = get_tick_ms();
 
     /* 1) 把目标 slave 置 WAIT_ACK+pending_func=0x05 当"锁":
      *    lora_downlink_logic 看到 pending_func==0x05 直接 continue 跳过(不干扰),
@@ -449,19 +414,16 @@ int lora_business_unbind(const char *uid_hex)
      *    会再刷新一次, 这里先置 now 防止首次 3s 间隔检查立刻又发一帧。 */
     g_unbind.state            = UNBIND_PHASE1;
     memcpy(g_unbind.uid, uid, CFG_UID_BYTES);
-    g_unbind.is_sensor        = is_sensor;
     g_unbind.slave_idx        = idx;
     g_unbind.phase_start_tick = now;
     g_unbind.last_send_tick   = now;
     g_unbind.phase2_retry     = 0U;
 
-    log_info("[UNBIND] 向 %s(%02X%02X%02X) 发起 0x05 解绑, 进入阶段1(%s, type=%s)\r\n",
-             uid_hex, uid[0], uid[1], uid[2],
-             is_sensor ? "按上报周期, 只在它的接收窗口里发" : "30s, 每3s发",
-             is_sensor ? "sensor" : "device");
+    log_info("[UNBIND] 向 %s(%02X%02X%02X) 发起 0x05 解绑, 进入阶段1(按上报周期, 只在接收窗口里发)\r\n",
+             uid_hex, uid[0], uid[1], uid[2]);
 
-    /* 3) 先发一帧试一下(可能正好赶上设备还醒着); 失败/没响应也没关系:
-     *    声光靠 3s 墙钟重试, 液位等它下一次上报的窗口(见 lora_unbind_window_hit)。 */
+    /* 3) 先发一帧试一下(可能正好赶上设备还醒着); 失败/没响应也没关系，
+     *    后续等它下一次上报的窗口(见 lora_unbind_window_hit)。 */
     _unbind_send_frame();
     return 0;
 }

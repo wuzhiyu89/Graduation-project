@@ -18,8 +18,8 @@ extern "C" {
 #endif
 
 /* 命令处理函数（按域拆文件；命令表仍在 cloud_proto.c） */
-/* 配置域个数（域名表的顺序 = 文档 3.2） */
-#define CLOUD_CFG_SECTION_N 9u
+/* 配置域个数（毕设版: system/network/sensors/thresholds/ota/meta） */
+#define CLOUD_CFG_SECTION_N 6u
 extern const char *const cloud_cfg_section_names[CLOUD_CFG_SECTION_N];
 
 /* cloud_proto.c 提供、命令文件共用的基础设施 */
@@ -42,15 +42,8 @@ int  cloud_cmd_sen_query(const cloud_req_t *req, cJSON *data);
  * @note  sen.set 与 cfg.set(sensors[]) 共用, 保证两条路径对设备侧的口径一致。
  */
 bool cloud_push_sensor_params(const char *uid, uint16_t report_period_s);
-int cloud_cmd_dev_bind(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_dev_unbind(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_dev_set(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_dev_query(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_dev_ctrl(const cloud_req_t *req, cJSON *data);
 
-int cloud_cmd_rule_set(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_rule_query(const cloud_req_t *req, cJSON *data);
-int cloud_cmd_rule_mode(const cloud_req_t *req, cJSON *data);
+/* dev.* / rule.* 联动设备命令已随一体机删除 */
 
 int cloud_cmd_cfg_set(const cloud_req_t *req, cJSON *data);
 int cloud_cmd_cfg_query(const cloud_req_t *req, cJSON *data);

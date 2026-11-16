@@ -33,8 +33,7 @@
 #include "g4_urc.h"
 #include "xflash_store.h"  /* #flash 诊断命令 */
 #include "xf_log.h"        /* #flash log dump/clear/on/off */
-#include "level_eval.h"      /* #gear: level_render_template / CFG_*TEXT_MAX */
-#include "level_supervisor.h" /* #gear: 取当前水位渲染 {level} */
+/* 毕设版: #gear 联动调试命令已随一体机删除 */
 
 /* ==================== 日志口手敲 AT 控制台 ====================
  * USART1 接收中断 → 环形缓冲 → app_console_poll 拼行 → g4_io_send_cmd 转发给 4G。
@@ -415,16 +414,13 @@ void app_console_help(void)
              "只读不改, 不打断接收\r\n");
     log_info("[DIAG] #lorasend <hex> 空口【逐字节透传】发一串字节(不加帧头/不算 CRC), "
              "例: #lorasend AA5501AABB\r\n");
-    log_info("[DIAG] #bind [sensor|device] [秒] 本地开绑定窗口 —— 拔掉 SIM 卡(无 4G)也能绑设备; "
-             "默认 sensor 30 秒\r\n");
+    log_info("[DIAG] #bind [秒] 本地开液位绑定窗口 —— 拔掉 SIM 卡(无 4G)也能绑; "
+             "默认 30 秒\r\n");
     log_info("[DIAG] #set <10字符> 空口写【设备】出厂字段(0x06 每5s一条, 最多3条); "
              "#set self <10字符> 写网关自己的(落 Flash, 云端不可见)\r\n");
     log_info("[DIAG] #get 空口读【设备】字段(0x07 只发一次, 等约12s; 设备会重发0x08); "
              "#get self 打印网关自己的\r\n");
     log_info("[DIAG] #unbind <uid> 本地解绑(与云端同一条流程: 发0x05 等设备 ack), 不需要 4G\r\n");
-    log_info("[DIAG] #gear <0~%u> [uid] 强制下发某一档(不等水位越界), 联调用: "
-             "看音色/文本/颜色改动在设备上的实际效果\r\n",
-             (unsigned)(CFG_GEAR_COUNT - 1u));
     log_info("[DIAG] #flash [info|fmt|selftest|ring|log] 外挂 Flash 诊断: info=芯片/分区/超级块, "
              "fmt=格式化 META(首次使用), selftest=在 SPARE 区做写-读-擦校验, ring=数据环写读校验, "
              "log [n|stat|clear|on|off]=落盘日志(dump 最新 n 条, 默认 40)\r\n");
@@ -571,7 +567,7 @@ bool app_console_ext(const char *line)
             char     uid[CFG_UID_STR_MAX];
             uint16_t period_s;
 
-            if (sl[i].dev_type != SLAVE_TYPE_SENSOR) { continue; }
+            /* 毕设版从机表只装液位传感器, 不再按 dev_type 过滤 */
 
             cfg_uid_from_bytes(sl[i].dev_uid, uid);
             period_s = sensor_offline_period_for_uid(cfg, uid);
@@ -675,42 +671,18 @@ bool app_console_ext(const char *line)
         return true;
     }
 
-    /* ---------------- #bind [sensor|device] [window_s] ----------------
-     * 【本地开门绑设备 —— 拔掉 SIM 卡也能绑】
-     *
-     * 【为什么必须有】绑定走的是"设备主动发 0x04 → 网关回 0x80 → 设备回 0x80"。
-     *   但 on_frame 里那道门是:
-     *       if (g_bind.state != BIND_IDLE && func == 0x04) { 处理; }
-     *   ⇒ 【窗口没开, 0x04 直接当普通帧走白名单被丢掉】。而开窗只有一条路:
-     *     云端下发 sen.bind / dev.bind ⇒ 没有 4G 就永远开不了窗 ⇒ 绑不了。
-     *   本命令把 open_bind_window() 暴露到控制台, 于是纯 LoRa 台架也能绑。
-     *
-     * 用法: #bind sensor [window]     (液位, 默认 30 秒)
-     *       #bind device [window]     (声光)
-     * ⚠️ 必须显式给 sensor/device: 0x04 帧不带设备类型, 开错窗口会把声光
-     *    当成液位写入 sensors[] 并排队 0x01(带校时), 现场表现为"声光被校时"。
-     * ⚠️ serial/name 留空 —— 那是平台侧的元数据, 离线时没有; 绑定后可用 cfg.set 补。
-     * ⚠️ 声光默认 dev_type=3(一体机), 需要别的类型请用云端 dev.bind 下发。 */
+    /* ---------------- #bind [window_s] ----------------
+     * 本地开液位绑定窗口：设备发 0x04 → 网关回 0x80 → 设备回 0x80 → 写入 sensors[]。
+     * 拔掉 SIM 卡（无 4G）也能绑；云端入口为 sen.bind。
+     * 用法: #bind [window]，默认 30 秒，范围 1~300 秒。
+     * serial/name 留空 —— 那是平台侧元数据，离线时没有，绑定后可用 cfg.set 补。 */
     if (strncmp(line, "#bind", 5) == 0)
     {
         const char *p = line + 5;
-        bool        is_sensor = false;
-        bool        type_given = false;
-        unsigned    win_s      = 30u;
+        unsigned    win_s = 30u;
 
         while (*p == ' ') { p++; }
 
-        if (strncmp(p, "device", 6) == 0)      { is_sensor = false; type_given = true; p += 6; }
-        else if (strncmp(p, "sensor", 6) == 0) { is_sensor = true;  type_given = true; p += 6; }
-
-        if (!type_given)
-        {
-            log_info("[TEST] !! #bind 必须显式给类型: #bind sensor [窗口秒] / #bind device [窗口秒]\r\n");
-            log_info("[TEST]    0x04 帧不带设备类型, 开错窗口会把声光当液位绑(之后会收到 0x01 校时)\r\n");
-            return true;
-        }
-
-        while (*p == ' ') { p++; }
         if ((*p >= '0') && (*p <= '9'))
         {
             win_s = 0u;
@@ -726,17 +698,16 @@ bool app_console_ext(const char *line)
             win_s = 30u;
         }
 
-        if (!config_store_can_add(is_sensor))
+        if (!config_store_can_add(true))
         {
-            log_info("[TEST] !! #bind %s 已达上限(液位≤4 / 声光≤3 / 总≤5), 先解绑再绑\r\n",
-                     is_sensor ? "液位传感器" : "声光设备");
+            log_info("[TEST] !! 液位传感器已达上限, 先解绑再绑\r\n");
             return true;
         }
 
-        if (lora_business_open_bind_window("", "", (uint16_t)win_s, is_sensor, 3u))
+        if (lora_business_open_bind_window("", "", (uint16_t)win_s))
         {
-            log_info("[TEST] #bind 已开窗 %us type=%s —— 现在让设备发 0x04(绑定请求)\r\n",
-                     win_s, is_sensor ? "sensor" : "device");
+            log_info("[TEST] #bind 已开窗 %us(type=sensor) —— 现在让液位设备发 0x04\r\n",
+                     win_s);
             log_info("[TEST] #bind 成功后会打 [BIND] ... 绑定成功; 失败/断链看 [BIND] !! 行\r\n");
         }
         else
@@ -865,71 +836,6 @@ bool app_console_ext(const char *line)
         return true;
     }
 
-    /* ---------------- #gear <档位> [uid] ----------------
-     * 强制把某一档下发到声光设备,【不等水位真的越过阈值】。联调专用。
-     *
-     * 【为什么需要】甲方改了音色 / 文本 / 颜色之后, 现场要立刻看到设备怎么播、
-     *   屏怎么显示。不可能坐在井边等水位涨到那一段去触发。而这个命令走的是
-     *   与自动链路【完全同一条】路径(level_render_template -> apply_gear_ex),
-     *   所以验到的字节就是现场真会发出去的字节。
-     *
-     * 用法: #gear 1            发到全部启用的声光设备
-     *       #gear 1 2100...01  只发这一台(调试设备侧解析用) */
-    if (strncmp(line, "#gear", 5) == 0)
-    {
-        const config_store_t *cfg = config_store_get();
-        char        led1[CFG_LEDTEXT_MAX + 1];
-        char        led2[CFG_LEDTEXT_MAX + 1];
-        char        tts[CFG_TTSTEXT_MAX + 1];
-        const char *p    = line + 5;
-        const char *uidp = NULL;
-        int32_t     lv_mm = 0;
-        int         g = -1;
-        int         sent;
-
-        while (*p == ' ') { p++; }
-        if ((*p < '0') || (*p > '9'))
-        {
-            log_info("[GEAR] !! 用法: #gear <0~%u> [uid]  例: #gear 1\r\n",
-                     (unsigned)(CFG_GEAR_COUNT - 1u));
-            return true;
-        }
-        while ((*p >= '0') && (*p <= '9'))
-        {
-            g = ((g < 0) ? 0 : (g * 10)) + (int)(*p - '0');
-            p++;
-        }
-        while (*p == ' ') { p++; }
-        if (*p != '\0') { uidp = p; }
-
-        if ((g < 0) || (g >= (int)CFG_GEAR_COUNT))
-        {
-            log_info("[GEAR] !! 档位 %d 越界, 有效 0~%u\r\n",
-                     g, (unsigned)(CFG_GEAR_COUNT - 1u));
-            return true;
-        }
-
-        (void)level_supervisor_last(&lv_mm, NULL);
-
-        led1[0] = '\0';
-        led2[0] = '\0';
-        tts[0]  = '\0';
-        (void)level_render_template(led1, (uint16_t)sizeof(led1),
-                                    cfg->gears[g].led_text1, lv_mm);
-        (void)level_render_template(led2, (uint16_t)sizeof(led2),
-                                    cfg->gears[g].led_text2, lv_mm);
-        (void)level_render_template(tts,  (uint16_t)sizeof(tts),
-                                    cfg->gears[g].tts_text,  lv_mm);
-
-        sent = lora_business_apply_gear_ex((uint8_t)g, uidp, led1, led2, tts,
-                                           NULL, 0u, NULL);
-        log_info("[GEAR] #gear %d -> 投递 %d 台 (voice=%u %s, 云端码 %d, "
-                 "各台音量取 devices[].volume, 水位 %ldmm)\r\n",
-                 g, sent, (unsigned)cfg->gears[g].voice,
-                 cfg_voice_names[(cfg->gears[g].voice <= 5u) ? cfg->gears[g].voice : 0u],
-                 cfg_voice_to_cloud(cfg->gears[g].voice), (long)lv_mm);
-        return true;
-    }
 #else
     if (strcmp(line, "#lora") == 0)
     {

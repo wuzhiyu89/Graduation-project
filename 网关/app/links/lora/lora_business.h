@@ -7,7 +7,6 @@
  *   lora_slave.c     —— 从机表（hex 工具 / 装载 / 增删 / 在线状态）
  *   lora_bind.c      —— 0x04 绑定窗口状态机
  *   lora_unbind.c    —— 0x05 解绑两阶段状态机
- *   lora_alarm.c     —— 0x03 执行结果状态机 + 档位联动下发
  *   lora_downlink.c  —— 下发队列（投递 / 空口发送 / ACK 重传 / MQTT 下行）
  *   lora_field.c     —— 出厂字段 0x06/0x07/0x08
  *   lora_business.c  —— 帧分发 / 0x02 上报 / 失联检测 / init / poll
@@ -21,11 +20,10 @@
  *     ├─ 0x02 sensor_report → data_cache_up_push + ACK(0x80)
  *     ├─ 0x80 ACK_OK        → data_cache_down_del_by_uid(state=IDLE)
  *     ├─ 0x81 ACK_ERR       → state=IDLE 等下次重试
- *     ├─ 0x82/0x83          → 声光执行结果（lora_alarm.c）
  *     └─ 其他               → ...
  *
  *   MQTT下行 → g4_urc URC → lora_mqtt_recv_cb → 校验/解帧 → data_cache_down_push
- *   LoRa下发 → lora_business_poll → lora_reply_logic / lora_try_send_alarm_idle
+ *   LoRa下发 → lora_business_poll → lora_reply_logic
  *               对每台 SLAVE_STATE_IDLE 从机: fetch_by_uid → lora_proto_send_frame → state=WAIT_ACK
  */
 #ifndef __LORA_BUSINESS_H__
@@ -43,8 +41,6 @@ extern "C" {
 /* ========== 可配置常量 ========== */
 /* 【从机表是动态的】(2026-09-29 改造, P5): 从机表不再写死, 改为从 config_store
  * 的 sensors[]/devices[] 装载, 并支持运行期绑定/解绑(LoRa 0x04/0x05)。
- * - LORA_SLAVE_MAX: RAM 数组上限 = 传感器槽 + 设备槽(够装就行, 实际受
- *   config_store_can_add 的「总数≤5/液位≤4/声光≤3」约束)
  * - 运行期台数由 lora_business_get_slave_count() 返回(不再有编译期 LORA_SLAVE_CNT) */
 #define LORA_ACK_TIMEOUT_MS     10000U  /* ACK 应答超时 ms */
 #define LORA_MAX_RETRY          3U      /* 最大重传次数(耗尽后【丢弃该条下发缓存】, 由云端重新下发) */
@@ -110,15 +106,13 @@ typedef enum
 /* ========== 从机固定配置(只读, 定义在 lora_business.c) ========== */
 typedef struct
 {
-    uint8_t      dev_uid[LORA_UID_BYTES];    /* 13 字节地址(类型 + 96 位芯片 UID), hex 串 26 字符 */
-    slave_type_t dev_type;      /* SLAVE_TYPE_SENSOR / SLAVE_TYPE_ALARM_OUT */
+    uint8_t dev_uid[LORA_UID_BYTES];    /* 13 字节地址(类型 + 96 位芯片 UID), hex 串 26 字符 */
 } lora_slave_cfg_t;
 
 /* ========== LoRa 从机信息 ========== */
 typedef struct
 {
     uint8_t            dev_uid[LORA_UID_BYTES];       /* 设备唯一 UID (13B) */
-    slave_type_t       dev_type;         /* SLAVE_TYPE_SENSOR / SLAVE_TYPE_ALARM_OUT */
     bool               is_online;        /* 是否在线(收到过帧) */
     uint32_t           last_recv_tick;   /* 上次收到上行帧的 tick ms */
     lora_slave_state_t state;
@@ -145,41 +139,11 @@ typedef struct
      *   (从机表在 RAM 里, 没有持久化依赖)。下次重构可以删掉。 */
     bool               low_bat_reported;
 
-    /* ---- ★2026-10-08 声光(0x03)"三段式应答"状态★ ----
-     * 设备对 0x03 回两条: 0x80(收到了) → 0x82(成功) / 0x83(失败)。
-     * 0x80 不再是终态, 所以 0x03 必须【单独】跟一个 15 秒窗口 + 自己的重试计数 ——
-     * 【不能复用 retry_cnt】: 那个是"帧级重传"(发出去没被解出来就重发同一个字节流),
-     * 而这里是"设备明确回了失败/没回结果", 重发的是【整条业务动作】, 语义和计数规则都不同。
-     * 用户口径(2026-10-08): 总共发 3 条(首次 + 2 次重试); 3 条都没成功 ⇒ 上报设备离线。 */
-    bool               alarm_pending;     /* true = 正在等 0x82/0x83 */
-    uint8_t            alarm_attempts;    /* 本条动作已经发了几次(上限 3) */
-    uint8_t            alarm_gear;        /* 本次动作的档位(上报 event.action 要用) */
-    uint32_t           alarm_tick;        /* 本条发出的时刻(判 15 秒超时) */
-
-    /* ★2026-10-18 (丙): 这台声光是否【已经报过"离线"】且还没恢复 ★
-     *   置 true  : lora_alarm_on_fail() 里 3 条配额用完、判定它离线的那一刻;
-     *   清 false : 收到 0x82 执行成功时(并在那一次回调里带 recovered=true,
-     *              让主程序补一条 event.device{"online"})。
-     * 【为什么要这个位】原来只有失败那一次发 event.device{"offline"},
-     *   设备后来恢复了也【没有任何"恢复"事件】—— 平台侧的离线告警会一直
-     *   挂着, 只能靠人工确认。有了这个位, 恢复的第一时间就能自动补报。 */
-    bool               alarm_offline_reported;
-    bool               alarm_fault_display; /* 本条是 off 故障画面: 不产生常规 event.action */
 } lora_slave_t;
 
-/* ========== 设备在线状态查询(★2026-10-18 新增) ==========
- * 【为什么需要它】sen.query / dev.query 的 online 字段原来是"看 last_value 快照
- *   + 3×上报周期"算的 —— 那只对【液位传感器】成立。声光报警器从不发 0x02,
- *   所以它永远不进快照表 ⇒ dev.query 里声光的 online 恒为 false, 哪怕它刚刚
- *   执行成功过。平台据此判断"设备掉线"就会一直误报。
- *
- * 【本函数的判据】直接查从机表的真实状态, 两种设备各用各的口径:
- *     · 液位传感器(SLAVE_TYPE_SENSOR)    : lora_slave_t.is_online
- *       (由 sensor_offline 状态机维护, 与失联检测完全同一套)
- *     · 声光报警器(SLAVE_TYPE_ALARM_OUT) : !alarm_offline_reported
- *       (只有"3 条 0x03 都没成功"才置位, 收到 0x82 就清掉 —— 这是网关对声光
- *        唯一确凿的死活证据; 不用 last_recv_tick, 因为声光平时不收帧会误判)
- *   不在从机表里 ⇒ UNKNOWN(调用方自己决定怎么兜底)。 */
+/* ========== 液位传感器在线状态查询 ==========
+ * 直接查从机表的 is_online（由 sensor_offline 状态机维护）。
+ * 不在从机表里 ⇒ UNKNOWN（调用方自己决定怎么兜底）。 */
 typedef enum
 {
     LORA_DEV_STATE_UNKNOWN = 0,     /* 从机表里没有这台(可能刚解绑/还没绑) */
@@ -269,9 +233,6 @@ void lora_business_init(void);
  */
 void lora_business_ensure_slaves(void);
 
-/** 给全部 enabled 声光排一条 0x09 在线查询(水位未变化时用) */
-void lora_business_ping_alarms(void);
-
 /**
  * \brief 业务层轮询 (main while(1) 持续调):
  *          协议层 poll → 帧分发 → ACK 超时重传检测
@@ -293,13 +254,12 @@ bool lora_business_send_ack(const uint8_t gw_uid[LORA_UID_BYTES], const uint8_t 
  * \brief 上层业务调用: 存入下发缓存, 不直接发送
  *        等待设备下次上报上行帧时, poll 会自动取出并发送
  * \param uid      目标从机 UID (13B)
- * \param dev_type 设备类型 (sensor/alarm_out)
- * \param func     功能码 (0x01 设置传感器 / 0x03 设置声光)
+ * \param func     功能码 (毕设版只允许 0x01 设置传感器参数)
  * \param data     载荷 (不含 CRC, 协议层会自动加)
  * \param data_len 载荷长度
  * \return 0 成功; -1 载荷过长; -2 找不到从机
  */
-int lora_business_send_req(const uint8_t uid[LORA_UID_BYTES], slave_type_t dev_type,
+int lora_business_send_req(const uint8_t uid[LORA_UID_BYTES],
                            uint8_t func, const uint8_t *data, uint8_t data_len);
 
 /* ==================== 液位 0x01 的默认参数(单一来源) ====================
@@ -429,38 +389,6 @@ typedef void (*lora_level_report_fn)(const uint8_t uid[LORA_UID_BYTES],
 /** 注册"每次液位上报"回调; 传 NULL 取消 */
 void lora_business_set_level_report_cb(lora_level_report_fn fn);
 
-/* ==========================================================================
- * ★★2026-10-08 新增: 声光执行结果回调(用户 A1/A3)★★
- * ==========================================================================
- * 声光设备收到 0x03 后会先后回两条: 0x80(收到了) → 0x82(成功) / 0x83(失败)。
- * 本回调把【最终结果】告诉主程序, 由它组 event.action 上报云端。
- *
- * \param uid_hex   26 位 hex 串（13 字节）(例 "31000000000000000000000001")
- * \param gear      本次动作的档位 0~3
- * \param ok        true  = 收到 0x82(执行成功)
- *                  false = 收到 0x83, 或 15 秒超时(总算上仍算失败)
- * \param gave_up   true  = 【已经重试用尽】(总共发了 3 条仍没成功)
- *                  ⇒ 调用方除了上报 event.action{失败}, 还应额外上报一条
- *                     event.device{"offline"}(设备离线)
- *                  false = 还在重试, 这次失败只是中间态
- * \param recovered ★2026-10-18 (丙) 新增★
- *                  true  = 这一次 ok=true, 而且【之前已经报过这台设备离线】
- *                          ⇒ 调用方除了 event.action{成功}, 还应【补报一条
- *                            event.device{"online"}】(设备恢复)
- *                  false = 普通结果(从没离线过, 或已经是离线的重复失败)
- *
- * 【调用时机】每条 0x03 有且只有一次 gave_up=true(或者一次 ok=true 收尾)。
- *   中间的重试【不】回调 —— 免得平台看到三次"失败"却其实第三次成功了。
- *   (与用户口径一致: "三次都没响应需要上报声光报警器离线")
- *
- * \note 回调里【不要阻塞】。不注册时只打日志, 不影响主循环。
- */
-typedef void (*lora_alarm_result_fn)(const char *uid_hex, uint8_t gear,
-                                     bool ok, bool gave_up, bool recovered);
-
-/** 注册声光执行结果回调; 传 NULL 取消 */
-void lora_business_set_alarm_result_cb(lora_alarm_result_fn fn);
-
 /**
  * \brief 检查一遍全部液位从机是否失联, 该报的就调回调
  *
@@ -533,22 +461,19 @@ typedef enum
 /**
  * \brief 绑定/解绑事件回调签名
  * \param uid_hex 26 位 hex 串（13 字节）(绑定时是被绑设备的 uid; 解绑时是被删设备的 uid)
- * \param is_sensor true=液位, false=声光
  * \param event 事件类型
  * \note  回调里【不要阻塞】(发布应是非阻塞登记)。不注册时只打日志。
  */
-typedef void (*lora_bind_event_fn)(const char *uid_hex, bool is_sensor,
-                                    lora_bind_event_t event);
+typedef void (*lora_bind_event_fn)(const char *uid_hex, lora_bind_event_t event);
 
 /** 注册绑定/解绑事件回调; 传 NULL 取消 */
 void lora_business_set_bind_event_cb(lora_bind_event_fn fn);
 
 /**
  * \brief 打开绑定窗口(pair_hook 的实现, 由 main.c 注册给 cloud_proto)
- * \param serial  云端 dev.bind 携带的 serial(本工程不启用, 仅作元数据存 config_store)
- * \param name    云端 dev.bind 携带的 name(同上)
+ * \param serial  云端 sen.bind 携带的 serial(本工程不启用, 仅作元数据存 config_store)
+ * \param name    云端 sen.bind 携带的 name(同上)
  * \param window_s 窗口秒数(文档默认 60)
- * \param is_sensor true=液位传感器(sen.bind), false=联动设备(dev.bind)
  * \return true 成功打开; false 参数非法或已有窗口进行中
  *
  * ★★ 一个窗口只能配【一台】设备(2026-09-30 用户明确定下) ★★
@@ -562,11 +487,10 @@ void lora_business_set_bind_event_cb(lora_bind_event_fn fn);
  * \note  与 cloud_pair_open_fn 签名一致, 直接作为 pair_hook 注册
  */
 bool lora_business_open_bind_window(const char *serial, const char *name,
-                                     uint16_t window_s, bool is_sensor,
-                                     uint8_t dev_type);
+                                     uint16_t window_s);
 
 /**
- * \brief 发起解绑(由 cloud_proto 的 dev.unbind 调用) —— 启动两阶段状态机
+ * \brief 发起解绑(由 cloud_proto 的 sen.unbind 调用) —— 启动两阶段状态机
  * \param uid_hex 26 位 hex 串（13 字节）, 必须已在从机表里
  * \return 0 成功启动解绑状态机(异步, 真正删除在阶段2 成功后);
  *         -1 uid 非法; -2 不在从机表; -3 已有解绑在进行
@@ -575,129 +499,6 @@ bool lora_business_open_bind_window(const char *serial, const char *name,
  *        PHASE1(30s) + WAIT_CLEAR(15s) + PHASE2*3(10s*3) = 75s。
  */
 int lora_business_unbind(const char *uid_hex);
-
-/* ==================== 档位联动下发(自治"最后一跳") ====================
- * (2026-09-30, 用户第 2 条)
- * 把 level_supervisor 算出的档位动作按 config_store 的 gears[gear] 模板组帧,
- * 投递给目标联动设备。payload 布局"待声光设备协议确认"的说明见 .c。
- */
-
-/** 上次成功下发过的档位(0~3); 0xFF = 还没下发过。给状态上报/诊断用 */
-uint8_t lora_business_last_gear(void);
-
-/** 联动下发计数: ok = 成功投递的目标台数, skip = 跳过/失败的台数 */
-void lora_business_gear_stats(uint16_t *ok, uint16_t *skip);
-
-/**
- * \brief 档位联动下发 —— 边缘自治"最后一跳"的入口
- * \param gear     目标档位 0~3
- * \param level_mm 当前有效水位(mm, 仅用于日志)
- * \param led_text 渲染后的 LED 文本(可 NULL/空)
- * \param tts_text 渲染后的语音文本(可 NULL/空; 只有 soundMode==2 才发)
- * \param out_total 可选输出: 目标设备总台数(用来区分"没设备"和"发失败")
- * \return >=0 成功投递的设备台数; -1 参数非法
- * \note  只投递到下发缓存, 不阻塞; 空口发送由 lora_business_poll() 完成。
- *        调用方在返回值 >0 时才调 level_supervisor_mark_sent();
- *        total==0(压根没有启用的联动设备)时可以直接 mark, 免得上报一次就重试一次。
- */
-int lora_business_apply_gear(uint8_t gear, int32_t level_mm,
-                             const char *led_text1, const char *led_text2, const char *tts_text,
-                             uint8_t *out_total);
-
-/* ==================== 手动控制(dev.ctrl)用 ====================
- * (2026-09-30 用户第 6 条)
- * 与自动联动的差别只有两点: ① 目标可以是【指定的一台】而不是 gears[].targets;
- * ② 要逐台回报受理结果(应答里的 data.results[])。
- * 复用的是同一条投递链(send_req -> 下发缓存 -> ACK/重试), 没有第二套。
- */
-
-/** 一路联动下发的受理结果(逐台) */
-typedef struct
-{
-    /* 本头文件有意不 include config_store.h(保持业务层不依赖配置层),
-     * 所以这里用一个本地长度: 6 位 hex + '\0' + 余量。 */
-    char     uid[27];      /* 2026-10-18: UID 扩到 13 字节 => hex 串 26 字符 + NUL */
-    uint16_t code;                  /* ★ 必须是 uint16: 错误码是 1003/1007 这种三位数
-                                     *   (2026-09-30 用 uint8_t 时被静默截成 239, 编译
-                                     *    警告抓出来的) */
-                                    /* 0    = 已受理(已投递到下发缓存)
-                                     * 1003 = 目标设备不存在(不在从机表/已停用)
-                                     * 1007 = 网关内部错误(uid 非法/组帧失败) */
-} lora_gear_result_t;
-
-/**
- * \brief 档位联动下发(带目标过滤 + 逐台结果) —— dev.ctrl 用
- * \param only_uid NULL = 按 gears[gear].targets 选(与自动联动一致);
- *                 非 NULL = 只发这一台("all" 的语义由调用方翻译成 NULL)
- * \param res/res_cap 逐台结果数组(可 NULL); 最多写 res_cap 条
- * \param out_total   可选: 目标总台数
- * \return >=0 成功受理的台数; -1 参数非法
- */
-/** off fail-safe 专用故障画面: 全屏两行, 不闪/无语音/音量0, 发给全部 enabled 声光.
- *  res/cap 可选: 逐台填 uid+错误码, 供 event.action 使用. 返回投递台数.
- *  ★2026-11-02: res[] 用【紧凑下标】(只数启用的设备), 与 out_total 一致;
- *    以前按设备下标填, 前面有停用设备时会错位。
- *  ★2026-11-03: 【不再被 off 策略调用】—— 用户定稿 "off 档位就是档位 0",
- *    现在走 lora_business_apply_gear_ex(0, ...) 的正常档位链路。
- *    本函数暂时保留(便于回退/将来别的场景), 但不要在新代码里用。 */
-int lora_business_apply_fault_display(lora_gear_result_t *res, uint8_t res_cap,
-                                      uint8_t *out_total);
-
-int lora_business_apply_gear_ex(uint8_t gear, const char *only_uid,
-                                const char *led_text1, const char *led_text2, const char *tts_text,
-                                lora_gear_result_t *res, uint8_t res_cap,
-                                uint8_t *out_total);
-
-/* ==========================================================================
- * ★★2026-10-10 新增: dev.ctrl 的【本次下发】样式覆盖★★
- * --------------------------------------------------------------------------
- * 【要解决什么】dev.ctrl 原来只能覆盖三段文本(ledText1/2, ttsText), 不能覆盖
- *   ledShowMode / ledTextShowMode / ledColor —— 空口 out[3] 里本来就有位置
- *   (bit7 / bit5,4 / bit3,2 / bit1,0), 只是取值固定来自档位配置, 平台改不了。
- *
- * 【为什么用"设置 + 清除"两个函数, 而不是给 apply_gear_ex 加参数】
- *   加参数要改 5 处(lora_business.h/.c、cloud_proto.c、main.c, 还有主机单测的
- *   fake_lora_business.c/.h 同名假实现)。用模块级静态覆盖只动本模块, 而且与文本
- *   那边"没给就用档位模板"的 given 语义天然对齐。
- *
- * 【语义(用户 2026-10-10 确认)】
- *   · 【临时盖一下】—— 只影响紧接着的那一次下发, 不写 config_store、不持久化
- *   · valid_mask 区分"没给"(用档位配置)与"给了"(用覆盖值)
- *   · ledShowMode:      0 横 / 1 竖        (只有 0/1)
- *   · ledTextShowMode:  0 居中 / 1 对齐    (只有 0/1; 半屏1,半屏2 用逗号串)
- *   · ledColor:         off/red/green/yellow(半屏1,半屏2 用逗号串)
- *
- * ⚠️ 调用顺序必须是 set -> apply_gear_ex -> clear。忘了 clear 覆盖会粘到下一次
- *    自动联动上(不会崩, 但档位样式不对)。
- * ======================================================================== */
-#define LORA_STYLE_SHOW_MODE   0x01u   /* bit0: 覆盖 ledShowMode      */
-#define LORA_STYLE_TEXT_MODE   0x02u   /* bit1: 覆盖 ledTextShowMode  */
-#define LORA_STYLE_COLOR       0x04u   /* bit2: 覆盖 ledColor         */
-#define LORA_STYLE_VOICE       0x08u   /* bit3: 覆盖 voice(音色 0~5)  */
-
-/** 登记本次下发的样式覆盖(只在紧接着的 apply_gear_ex 里生效) */
-void lora_business_set_gear_style(uint8_t valid_mask, uint8_t show_mode,
-                                  uint8_t text_mode_h1, uint8_t text_mode_h2,
-                                  uint8_t color_h1, uint8_t color_h2);
-
-/**
- * @brief 登记本次下发的【音色覆盖】(只在紧接着的 apply_gear_ex 里生效)
- * @param voice 设备口径 0~5(0 艾佳 / 1 艾诚 / 2 艾达 / 3 艾琪 / 4 唐老鸭 / 5 艾彤)
- *
- * ★2026-11-11 新增★ 起因: dev.ctrl 里带 `"voice":54` 时, 云端以为改了音色,
- *   网关却把这一字段【整个忽略】—— 既不换音色也不报错, 现场只看到"音色没变"。
- *   ⇒ 现在 dev.ctrl 收 voice(云端码) -> cfg_voice_from_cloud() 换成设备号 -> 本函数。
- *
- * 【为什么不直接改 cfg->gears[gear].voice】那是 Flash 里的持久配置。dev.ctrl 是
- *   "手动播一次"的临时覆盖, 播完必须失效, 否则平台手动播过一条之后, 这一档位
- *   的音色就被永久改掉了(与 ledColor/文本覆盖同一条理由)。
- * @note 与 lora_business_set_gear_style() 可以叠加调用; 由
- *       lora_business_clear_gear_style() 一并清掉(它清整个掩码)。
- */
-void lora_business_set_gear_voice(uint8_t voice);
-
-/** 清掉覆盖(下发完立刻调; 也用于出错路径) */
-void lora_business_clear_gear_style(void);
 
 /* ==================== LoRa 射频健康状态 ====================
  *

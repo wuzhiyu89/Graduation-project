@@ -6,29 +6,15 @@
 /* =========可配置项========= */
 #define DATA_CACHE_DOWN_MAX_ITEM    16U     /* 网关下发指令缓存最大条数 */
 
-/* 设备类型 */
-typedef enum
-{
-    SLAVE_TYPE_SENSOR    = 0,   //液位传感器
-    SLAVE_TYPE_ALARM_OUT = 1    //联动告警输出设备（声光TTS‑LED）
-}slave_type_t;
-
 /**
  * @brief 下发缓存条目：网关待下发给LoRa从机指令
  */
 typedef struct
 {
     uint8_t         dev_uid[13];         // 目标从机 UID(13 字节: 类型 + 96 位芯片 UID)
-    slave_type_t    dev_type;           //设备类型
-    uint8_t         payload[211];       /* 原始待下发报文: 1 字节 func + 最多 206 字节载荷
-                                         * ★2026-10-08: 64 -> 211★ 联动 0x03 载荷从 63 涨到 206
-                                         * (两段 LED + 一段 TTS), 缓冲必须跟着涨, 否则
-                                         * data_cache_down_push() 会把整条指令判成"超长"拒收。
-                                         * 211 = 1(func) + 206(0x03 载荷上限) + 4 余量;
-                                         * 真正的上限由 LEVEL_GEAR_PAYLOAD_MAX(206) 决定,
-                                         * 这里只是"装得下"的缓冲大小。
-                                         * 代价: 单条约 236 字节, 16 条 ≈ 3.7KB RAM。
-                                         * (设备侧缓存不由网关负责, 见 lora_downlink.c 的说明) */
+    uint8_t         payload[32];        /* 原始待下发报文: 1 字节 func + 载荷
+                                         * 毕设版只有液位传感器，最长下发为 0x01 的
+                                         * 18 字节参数帧；32 字节留足余量。 */
                                          /* (后面会追加CRC16) */
     uint8_t         pay_len;            //报文有效长度，不含CRC2字节
     bool            valid;              //条目是否有效
@@ -66,16 +52,15 @@ void data_cache_up_push(const uint8_t *uid, uint16_t level_mm, uint16_t bat_pct,
  * @param len 载荷长度N，不含CRC
  * @return 0成功；‑1缓存满
  */
-int data_cache_down_push(uint8_t *uid, slave_type_t dev_type, uint8_t *buf, uint8_t len);
+int data_cache_down_push(uint8_t *uid, uint8_t *buf, uint8_t len);
 bool data_cache_down_fetch_by_uid(uint8_t *uid, cache_down_item_t *out_item);
 void data_cache_down_del_by_uid(uint8_t *uid);
 
 /**
  * @brief 只有"缓存里那条正是刚发出去的这一条"才删除(条件删除)
  *
- * 用途: 声光 0x03 是三段式(0x80 收到 -> 约 10s 后 0x82 结果)。等待期间云端可能
- * 又下发了一条新指令覆盖同一 uid 的缓存 —— 这时【不能】按 uid 无条件删,
- * 否则新指令被连带删掉, 设备停在旧档位且平台以为已成功。
+ * 用途: 设备 ACK 等待期间云端可能又下发了一条新指令覆盖同一 uid 的缓存 ——
+ * 这时【不能】按 uid 无条件删, 否则新指令被连带删掉, 平台以为已成功。
  *
  * @param uid  目标从机
  * @param func 刚发出的功能码

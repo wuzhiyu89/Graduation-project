@@ -4,7 +4,7 @@
  *
  * 这些量被"上报 / 下行 / 主循环 / 控制台"多处读取，但只由一个地方写入：
  *   · app_refresh_epoch()  由主循环/下行在需要时刷新（自带 10 分钟节流）
- *   · app_note_decision()  只由主循环在水位评估出【有效新样本】时调用
+ *   · app_note_level()     只由水位上报路径在拿到有效水位时调用
  *
  * 放在单独模块，是为了让 app_uplink / app_console / app_downlink 不必
  * include app_main.c（那会重新变成"什么都依赖 main"）。
@@ -14,7 +14,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "level_supervisor.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,8 +34,11 @@ bool app_epoch_valid(void);
 /** 配置里的"秒"换算成毫秒；0 或 >3600 时用 fallback_ms */
 uint32_t app_cfg_period_ms(uint16_t sec, uint32_t fallback_ms);
 
-/** 记下最近一次【有效】水位评估结果（new_sample && have_level 时才调） */
-void app_note_decision(const level_decision_t *ld);
+/**
+ * 记下最近一次有效水位算出的状态与档位（给 status/telemetry 打标签用）。
+ * state 是 level_state_t 数值(1..4)，gear 是 0..3；由水位上报路径调用。
+ */
+void app_note_level(uint8_t state, uint8_t gear);
 
 /** 当前实时档位（还没有过有效评估时返回 0） */
 uint8_t app_live_gear(void);

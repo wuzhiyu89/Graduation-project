@@ -2,11 +2,17 @@
 
 基于国民技术 **N32H482RE** 的「4G + LoRa」工业网关固件。
 
-- **本地**：LoRa（LLCC68 / SX1261，433 MHz）连接液位传感器与声光报警器
+- **本地**：LoRa（LLCC68 / SX1261，433 MHz）连接液位传感器（毕设版只有液位这一类从机）
 - **上云**：4G 模组（ML307R/ML307Y，UART AT）跑 MQTT，对接 RoadTwin 云协议
-- **自治**：水位边缘评估 + 联动下发；断网时事件/遥测缓存、恢复后按原时间戳补报
+- **自治**：水位状态评估 + 失联判定；断网时事件/遥测缓存、恢复后按原时间戳补报
 - **运维**：`#` 串口控制台、OTA over HTTP（+MD5）、A/B 健康计数
 - **产线**：不插 SIM 也能 `#bind` / `#set` / `#get` / `#unbind` 写出厂字段
+
+> **毕设版范围**：本项目为毕业设计裁剪版，只保留液位传感器数据通道。原独立项目中的
+> 「声光报警器 / 一体机」联动设备、`dev.*` / `rule.*` 云命令、`event.action` /
+> `event.status_change` 事件均已从固件删除。`MDK-ARM/网关云平台对接使用说明.md`
+> 与 `docs/ARCHITECTURE.md` 中的相关段落属历史协议存档，描述的是旧版全功能协议，
+> **对毕设版不再适用**；当前生效命令见下文「云协议」与 `app/cloud/cloud_proto.c`。
 
 > 架构、数据流、模块职责、约定与坑：见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。
 
@@ -19,11 +25,11 @@ N32H482-Gateway/
 │   ├── common/         通用：CRC/UTF-8、Flash 存储、分区表、环形缓冲
 │   ├── drivers/lora/   LLCC68 驱动 + 射频抽象 + 板级引脚
 │   ├── links/g4/       4G 链路：AT 传输、URC、建链状态机
-│   ├── links/lora/     LoRa 链路：帧协议、从机表、绑定/解绑/告警/字段
+│   ├── links/lora/     LoRa 链路：帧协议、从机表、绑定/解绑、出厂字段
 │   ├── links/serial/   RS232/RS485 通道（协议待定，仅建通道）
-│   ├── cloud/          云协议：信封/20 条命令/上行构造、JSON 读写
-│   ├── model/          配置模型：9 个配置域、掉电参数、档位、最后值
-│   ├── service/        业务服务：水位评估、失联判定、事件/遥测缓存、本地告警
+│   ├── cloud/          云协议：信封/13 条命令(sys/cfg/sen/ota)/上行构造、JSON 读写
+│   ├── model/          配置模型：6 个配置域、掉电参数、最后值
+│   ├── service/        业务服务：水位状态评估、失联判定、事件/遥测缓存、本地告警
 │   ├── ota/            OTA：HTTP 下载、分区写入、MD5、A/B 健康
 │   ├── log/            日志口（USART1）
 │   └── cjson/          cJSON + 静态池适配
@@ -32,7 +38,7 @@ N32H482-Gateway/
 ├── bsp/                延时 / 日志接口（SDK 支撑层）
 ├── firmware/           N32H48x 标准外设库（勿改）
 ├── MDK-ARM/            Keil 工程（CDC.uvprojx）
-├── _host_test/         主机测试（gcc，13 套件 / 1840 条断言）
+├── _host_test/         主机测试（gcc，18 套件）
 ├── archive/            已停用代码（不参与构建，见 archive/README.md）
 ├── docs/               架构文档
 └── 相关资料/            4G / LoRa / MCU 原厂资料
@@ -121,7 +127,7 @@ Get-Content $log -Tail 20
 powershell -ExecutionPolicy Bypass -File _host_test\run.ps1
 ```
 
-- 13 个套件、1840 条断言，跑在 PC 上（假 ML307R / 假 Flash / 假 LoRa）
+- 18 个套件，跑在 PC 上（假 ML307R / 假 Flash / 假 LoRa）
 - 全绿时最后一行是 `all host tests passed`，退出码 0
 
 一键验证（构建 + 测试）：
